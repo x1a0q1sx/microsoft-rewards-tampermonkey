@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.36
+// @version      1.0.1.37
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.36';
+        const SCRIPT_VERSION = '1.0.1.37';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -572,13 +572,21 @@
     nodes.btnAuthLink.onclick = () => window.open(AUTH_URL, '_blank');
 
     // 从完整 URL 或直接授权码中稳健提取 code
-    // 用正则取【原始】值：避免 URLSearchParams 把 '+' 当空格、也避免二次编码导致 400
+    // URL 里的 code 是 percent-encoded；先解码一次，后续兑换时再编码一次。
+    // 保留 '+' 而不用 URLSearchParams，避免微软授权码中的字面加号被误转为空格。
+    const safeDecodeAuthCode = value => {
+        try {
+            return decodeURIComponent(value);
+        } catch (_) {
+            return value;
+        }
+    };
     function extractAuthCode(raw) {
         if (!raw) return null;
         raw = raw.trim();
         if (raw.includes('code=')) {
-            const m = raw.match(/[?&]code=([^&?#]+)/);   // 取到 code= 后到 &/# 之前，保留原样
-            if (m && m[1]) return m[1];
+            const m = raw.match(/[?&]code=([^&?#]+)/);
+            if (m && m[1]) return safeDecodeAuthCode(m[1]);
         }
         const c = raw.split(/[&\s]/)[0].trim();          // 直接粘贴的裸 code
         return c || null;
@@ -587,7 +595,7 @@
     nodes.btnAuthSave.onclick = () => {
         const code = extractAuthCode(nodes.inAuth.value);
         if (code) {
-            GM_setValue('auth_code', code);              // 已 decode 一次，发送时只 encode 一次
+            GM_setValue('auth_code', code);              // 保存解码后的逻辑值；发送时统一 encode 一次
             state.authNeeded = false;
             nodes.boxAuth.style.display = 'none';
             log('✅ 授权码已保存，正在兑换 token...');
@@ -962,6 +970,42 @@
 
     // Token 获取
     let tokenExchangeBusy = false;
+    const AUTH_CODE_CLAIM_KEY = 'auth_code_claim';
+    const TOKEN_EXCHANGE_OWNER = uuid();
+
+    const readAuthCodeClaim = () => {
+        try {
+            return JSON.parse(GM_getValue(AUTH_CODE_CLAIM_KEY) || 'null');
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const releaseAuthCodeClaim = () => {
+        const claim = readAuthCodeClaim();
+        if (claim?.owner === TOKEN_EXCHANGE_OWNER) GM_setValue(AUTH_CODE_CLAIM_KEY, '');
+    };
+
+    async function claimAuthCodeExchange(code) {
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const claim = readAuthCodeClaim();
+            if (claim?.code === code && claim.owner !== TOKEN_EXCHANGE_OWNER &&
+                Date.now() - Number(claim.at || 0) < 15000) return false;
+
+            GM_setValue(AUTH_CODE_CLAIM_KEY, JSON.stringify({
+                owner: TOKEN_EXCHANGE_OWNER,
+                code,
+                at: Date.now()
+            }));
+            await sleep(80 + randomRange(0, 160));
+
+            const confirmed = readAuthCodeClaim();
+            if (confirmed?.owner === TOKEN_EXCHANGE_OWNER) return true;
+            if (confirmed?.code === code && Date.now() - Number(confirmed.at || 0) < 15000) return false;
+        }
+        return false;
+    }
+
     async function getAccessToken(opts = {}) {
         const forceRefresh = !!opts.forceRefresh;
         const preferCode = !!opts.preferCode;
@@ -981,7 +1025,7 @@
         }
 
         const code = GM_getValue('auth_code');
-        const refreshToken = GM_getValue('refresh_token');
+        let refreshToken = GM_getValue('refresh_token');
 
         if (!code && !refreshToken) {
             nodes.boxAuth.style.display = 'block';
@@ -990,7 +1034,25 @@
         }
 
         // 刚粘贴/捕获到新授权码 → 优先用 code 兑换；否则用 refresh_token 续期
-        const useCode = !!code && (preferCode || !refreshToken);
+        let useCode = !!code && (preferCode || !refreshToken);
+
+        // 一次性 code 必须全局只兑换一次：回调页和已打开的 Rewards 页会共享 GM 存储。
+        if (useCode && !(await claimAuthCodeExchange(code))) {
+            for (let i = 0; i < 16; i++) {
+                await sleep(500);
+                const latestRefresh = GM_getValue('refresh_token');
+                if (latestRefresh) {
+                    refreshToken = latestRefresh;
+                    useCode = false;
+                    break;
+                }
+                if (GM_getValue('auth_code') !== code) break;
+            }
+            if (useCode) {
+                log('🔑 授权码正由另一个标签页兑换，本页稍后刷新数据');
+                return null;
+            }
+        }
 
         // 调试：打印捕获到的 code 特征，便于定位 invalid_grant（格式错/过期/已用/被篡改）
         if (code) {
@@ -1035,7 +1097,10 @@
             try {
                 res = await doExchange(true);            // 首选标准 POST
             } catch (e1) {
-                if (e1 && (e1.status === 400 || e1.status === 0)) {
+                if (e1?.status === 400 && e1.responseText) {
+                    // OAuth 400 的 body 就是 token 错误 JSON；回退 GET 只会重复消费一次性 code。
+                    res = e1.responseText;
+                } else if (e1 && e1.status === 0) {
                     log('🔑 POST 失败，回退 GET 方式...');
                     res = await doExchange(false);
                 } else {
@@ -1092,6 +1157,7 @@
             }
         } finally {
             tokenExchangeBusy = false;
+            if (useCode) releaseAuthCodeClaim();
         }
         return null;
     }
