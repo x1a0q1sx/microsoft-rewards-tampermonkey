@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.35
+// @version      1.0.1.36
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
-// @updateURL    https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/Get_Microsoft_Rewards_fixed.user.js
-// @downloadURL  https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/Get_Microsoft_Rewards_fixed.user.js
+// @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
+// @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @author       QingJ
 // @icon         https://rewards.bing.com/rewardscdn/images/rewards.png
 // @match        https://www.bing.com/*
@@ -37,9 +37,9 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.35';
+        const SCRIPT_VERSION = '1.0.1.36';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
-        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/Get_Microsoft_Rewards_fixed.user.js';
+        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log('%c🔔 Microsoft Rewards 助手 v' + SCRIPT_VERSION + ' 已就绪',
             'color:#fff;background:#0078d4;padding:2px 8px;border-radius:4px;font-weight:bold');
@@ -106,6 +106,7 @@
     // 默认只在悬浮窗显示关键结果；完整诊断仍保留在代码中，排障时可改为 true。
     const SHOW_DETAIL_LOGS = false;
     const MAX_ACTIVITY_ATTEMPTS = 3;
+    const DAILY_STREAK_KEY_VERSION = 2;
     const getActivityTitle = item => String(
         item?.title || item?.attributes?.title || item?.offerId || item?.attributes?.offerid || '未知活动'
     ).replace(/\s+/g, ' ').trim().slice(0, 40);
@@ -1382,11 +1383,18 @@
         return { marker, anchor, originalHref, originalTarget: target };
     }
 
+    function restoreTrackedActivityTab(prepared) {
+        if (!prepared?.anchor || !prepared.originalHref) return;
+        // 新标签页已经在 click 的默认行为中同步创建。立即恢复页面原链接，
+        // 避免下一轮把“带标记的绝对 URL”误认成另一张活动卡。
+        prepared.anchor.setAttribute('href', prepared.originalHref);
+    }
+
     function findCurrentAutoCloseMarker() {
         const list = readAutoCloseTabs();
         return getAutoCloseMarkerFromCurrentUrl(list) || list.find(item =>
             (window.name && window.name === AUTO_CLOSE_TAB_PREFIX + item.id) ||
-            (window.opener && activityUrlMatchesMarker(item))
+            activityUrlMatchesMarker(item)
         ) || null;
     }
 
@@ -1452,20 +1460,24 @@
         try {
             const raw = GM_getValue(DAILY_STREAK_STATE_KEY, '');
             const data = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : null;
-            if (!data || data.date !== getDateHyphen()) return { date: getDateHyphen(), clickedKeys: [] };
+            if (!data || data.date !== getDateHyphen() || data.keyVersion !== DAILY_STREAK_KEY_VERSION) {
+                return { date: getDateHyphen(), keyVersion: DAILY_STREAK_KEY_VERSION, clickedKeys: [] };
+            }
             return {
                 date: data.date,
+                keyVersion: DAILY_STREAK_KEY_VERSION,
                 clickedKeys: Array.isArray(data.clickedKeys) ? data.clickedKeys : [],
                 inFlight: data.inFlight || null
             };
         } catch (e) {
-            return { date: getDateHyphen(), clickedKeys: [] };
+            return { date: getDateHyphen(), keyVersion: DAILY_STREAK_KEY_VERSION, clickedKeys: [] };
         }
     }
 
     function saveDailyStreakState(data) {
         GM_setValue(DAILY_STREAK_STATE_KEY, JSON.stringify({
             date: getDateHyphen(),
+            keyVersion: DAILY_STREAK_KEY_VERSION,
             clickedKeys: [...new Set(data.clickedKeys || [])].slice(-6),
             inFlight: data.inFlight || null
         }));
@@ -1717,7 +1729,12 @@
                 return (href.includes('rnoreward') ? 4 : 0) + (/\+\d+/.test(text) ? 3 : 0) +
                     (/活动|完成|搜索|阅读|测验|quiz|activity/.test(text) ? 1 : 0);
             };
-            return linkCards.sort((a, b) => score(b) - score(a)).slice(0, 3);
+            return linkCards
+                .map((el, index) => ({ el, index, score: score(el) }))
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 3)
+                .sort((a, b) => a.index - b.index)
+                .map(item => item.el);
         }
 
         // 兼容个别页面不用 a 标签而用 button/role=link 的版本。
@@ -1745,24 +1762,35 @@
         }
 
         // 侧边栏预期是 3 张子活动卡；优先选择带奖励值或 rnoreward 的链接。
-        return cards.sort((a, b) => {
+        return cards.map((el, index) => ({ el, index })).sort((a, b) => {
             const score = el => {
                 const text = normalizeDomText(el.innerText || el.textContent);
                 const href = (el.getAttribute('href') || '').toLowerCase();
                 return (href.includes('rnoreward') ? 4 : 0) + (/\+\d+/.test(text) ? 3 : 0) +
                     (/活动|activity/.test(text) ? 1 : 0);
             };
-            return score(b) - score(a);
-        }).slice(0, 3);
+            return score(b.el) - score(a.el);
+        }).slice(0, 3).sort((a, b) => a.index - b.index).map(item => item.el);
+    }
+
+    function normalizeDailyStreakCardHref(href) {
+        if (!href) return '';
+        try {
+            const url = new URL(href, location.href);
+            url.hash = '';
+            url.searchParams.delete('mr_auto_close');
+            url.searchParams.sort();
+            return url.href;
+        } catch (e) {
+            return href.replace(/#mr_auto_close=[^#&]+$/i, '');
+        }
     }
 
     const getDailyStreakCardKey = card => {
         if (!card) return '';
         const href = card.getAttribute('href') || '';
-        // 自动关闭标记只用于跨标签页识别，不应改变子卡的业务 key，
-        // 否则 React 重绘后可能把同一张卡再次当成未点击。
-        const cleanHref = href.replace(/#mr_auto_close=[^#&]+$/i, '');
-        return cleanHref ||
+        // 相对/绝对 URL、查询参数顺序和自动关闭标记都不能改变业务 key。
+        return normalizeDailyStreakCardHref(href) ||
             String(card.innerText || card.textContent || '').trim().replace(/\s+/g, ' ');
     };
 
@@ -1796,15 +1824,18 @@
         let root = panel;
         let progress = beforeProgress;
         let cards = getDailyStreakSubCards(root);
+        let missingPolls = 0;
         while (Date.now() < end) {
             root = await waitForDailyStreakPanel(350) || root;
             progress = readDailyStreakProgress(root);
             cards = getDailyStreakSubCards(root);
             const current = cards.find(card => getDailyStreakCardKey(card) === key);
             const advanced = beforeProgress != null && progress != null && progress > beforeProgress;
-            if (advanced || !current || isDailyStreakCardComplete(current)) {
+            if (advanced || (current && isDailyStreakCardComplete(current))) {
                 return { registered: true, panel: root, progress, cards };
             }
+            missingPolls = cards.length && !current ? missingPolls + 1 : 0;
+            if (missingPolls >= 3) return { registered: true, panel: root, progress, cards };
             await sleep(400);
         }
         return { registered: false, panel: root, progress, cards };
@@ -1879,20 +1910,26 @@
 
         const streakState = readDailyStreakState();
         const clicked = new Set(streakState.clickedKeys || []);
+        const plannedKeys = [...new Set(cards.map(getDailyStreakCardKey).filter(Boolean))].slice(0, 3);
         // 如果上一次 click 导致页面跳转，旧页面来不及写入 clickedKeys；
         // inFlight 表示该卡已经发起过真实点击，恢复时不要再次点它。
         if (streakState.inFlight) clicked.add(streakState.inFlight);
         const failedAttempts = new Map();
-        while (clicked.size < 3) {
+        while (true) {
             panel = await waitForDailyStreakPanel(1200) || panel;
             cards = getDailyStreakSubCards(panel);
-            const card = cards.find(candidate => {
-                return !clicked.has(getDailyStreakCardKey(candidate)) &&
-                    (failedAttempts.get(getDailyStreakCardKey(candidate)) || 0) < MAX_ACTIVITY_ATTEMPTS;
-            });
-            if (!card) break;
+            const key = plannedKeys.find(candidateKey =>
+                !clicked.has(candidateKey) && (failedAttempts.get(candidateKey) || 0) < MAX_ACTIVITY_ATTEMPTS
+            );
+            if (!key) break;
+            const card = cards.find(candidate => getDailyStreakCardKey(candidate) === key);
+            if (!card) {
+                failedAttempts.set(key, MAX_ACTIVITY_ATTEMPTS);
+                log(`❌ 活动卡片已从侧边栏消失，跳过本轮：任务 ${plannedKeys.indexOf(key) + 1}/3`);
+                continue;
+            }
             const text = (card.innerText || card.textContent || '').trim().replace(/\s+/g, ' ');
-            const key = getDailyStreakCardKey(card);
+            const taskNumber = plannedKeys.indexOf(key) + 1;
             const attempt = (failedAttempts.get(key) || 0) + 1;
             failedAttempts.set(key, attempt);
             const beforeProgress = readDailyStreakProgress(panel);
@@ -1904,9 +1941,13 @@
                 // 子卡可能导航到活动页；保存用户主动触发的恢复意图，
                 // 这样新页面加载后会回到 earn 并继续剩余卡片。
                 setPromoResumeIntent();
-                prepareTrackedActivityTab(card, text);
+                const trackedTab = prepareTrackedActivityTab(card, text);
                 // 触发完整的鼠标事件链，兼容 React/React-Aria 只监听 pointer/click 的卡片。
-                dispatchRewardsCardClick(card);
+                try {
+                    dispatchRewardsCardClick(card);
+                } finally {
+                    restoreTrackedActivityTab(trackedTab);
+                }
                 await sleep(700);
                 const result = await waitForDailyStreakCardResult(panel, key, beforeProgress, 6000);
                 panel = result.panel;
@@ -1915,7 +1956,7 @@
                 if (registered) {
                     clicked.add(key);
                     streakState.clickedKeys = [...clicked];
-                    log(`✅ 活动完成：${text.slice(0, 40)}${progress == null ? '' : `（${progress}/3）`}`);
+                    log(`✅ 活动完成 ${taskNumber}/3：${text.slice(0, 40)}${progress == null ? '' : `（${progress}/3）`}`);
                 } else {
                     if (attempt < MAX_ACTIVITY_ATTEMPTS) {
                         log(`🔁 活动失败，准备重试 ${attempt + 1}/${MAX_ACTIVITY_ATTEMPTS}：${text.slice(0, 40)}`);
@@ -1939,7 +1980,8 @@
         }
 
         const finalProgress = readDailyStreakProgress(panel);
-        const groupCompleted = finalProgress === 3 || clicked.size >= 3;
+        const allPlannedCardsCompleted = plannedKeys.length === 3 && plannedKeys.every(key => clicked.has(key));
+        const groupCompleted = finalProgress === 3 || allPlannedCardsCompleted;
         if (groupCompleted) {
             log('🎉 每日连续打卡活动已完成（活动 3/3）');
             dailyStreakGroupHandled = true;
@@ -1949,7 +1991,7 @@
             return true;
         }
         log(`⚠️ 每日连续打卡活动点击结束，当前进度 ${finalProgress == null ? '未读到' : finalProgress + '/3'}`);
-        return clicked.size > 0;
+        return plannedKeys.some(key => clicked.has(key));
     }
 
     async function ensureDailyActivityGroup() {
@@ -2590,11 +2632,12 @@
             } catch { }
 
             const pending = readPendingPromo();
-            // 标记过的活动标签页仍需执行正常的跨页恢复流程；它只是额外
-            // 带有“完成后关闭”的状态，不能因为是新标签页而跳过签到。
-            // 普通刷新/打开页面没有 resume intent，因此不会自动执行。
+            // 新开的活动标签页只负责让目标页面完成计分并等待主页面关闭。
+            // 若它也恢复 runPromo，会与主页面并发点击，出现 1、2、2 而漏掉第 3 张卡。
             if (pending && hasPromoResumeIntent()) {
-                if (isRewardsPage()) {
+                if (isTrackedActivityTab) {
+                    log('🧹 活动页面已加载，等待主页面完成剩余任务');
+                } else if (isRewardsPage()) {
                     log('↩️ 继续执行刚才主动开始的活动...');
                     clearPromoResumeIntent();
                     await runPromo(false);
