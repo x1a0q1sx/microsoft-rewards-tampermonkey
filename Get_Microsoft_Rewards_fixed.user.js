@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.37
+// @version      1.0.1.38
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.37';
+        const SCRIPT_VERSION = '1.0.1.38';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -1276,6 +1276,207 @@
         return null;
     }
 
+    // 新版 Rewards 已逐步废弃旧 reportactivity 接口；当旧 token 不可用时，
+    // 从 /earn 的 Next.js bundle 中发现 reportActivity Server Action 并直接调用。
+    const REWARDS_ORIGIN = 'https://rewards.bing.com';
+    let rewardsActionContext = null;
+    let rewardsActionContextPromise = null;
+    let rewardsActionUnavailable = '';
+
+    async function fetchRewardsText(url, accept, cookie) {
+        return await gmRequest({
+            url,
+            headers: {
+                Accept: accept,
+                ...(cookie ? { Cookie: cookie } : {})
+            },
+            anonymous: !!cookie
+        });
+    }
+
+    function extractRewardsActionIds(js) {
+        const byName = {};
+        const seen = new Set();
+        const hex = '[a-f0-9]{40,64}';
+        const knownNonNames = new Set(['callServer', 'findSourceMapURL', 'encodeFormAction', 'default']);
+        const patterns = [
+            new RegExp(`createServerReference\\s*\\)?\\s*\\(\\s*"(${hex})"([\\s\\S]{0,800}?)\\)`, 'g'),
+            new RegExp(`registerServerReference\\s*\\)?\\s*\\([^,]+,\\s*"(${hex})"([\\s\\S]{0,800}?)\\)`, 'g')
+        ];
+
+        for (const pattern of patterns) {
+            for (const match of js.matchAll(pattern)) {
+                const id = match[1];
+                if (!id || seen.has(id)) continue;
+                seen.add(id);
+                const names = [...String(match[2] || '').matchAll(/"([A-Za-z_$][\w$]*)"/g)]
+                    .map(item => item[1])
+                    .filter(name => !knownNonNames.has(name) && name.length > 3);
+                if (names.length) byName[names[names.length - 1]] = id;
+            }
+        }
+        return byName;
+    }
+
+    function extractDynamicRewardsChunks(js) {
+        const paths = new Set();
+        for (const match of js.matchAll(/"(static\/(?:immutable|chunks|media)\/[\w\-./()]+?\.js)"/g)) {
+            paths.add('/_next/' + match[1]);
+        }
+        for (const match of js.matchAll(/\b(\d{2,6}):"([a-f0-9]{12,})"/g)) {
+            paths.add(`/_next/static/chunks/${match[1]}-${match[2]}.js`);
+            paths.add(`/_next/static/chunks/${match[1]}.${match[2]}.js`);
+        }
+        return [...paths];
+    }
+
+    function rewardsRouterStateTree() {
+        const refreshFlag = 4096;
+        const tree = [
+            '',
+            {
+                children: [
+                    '(nav)',
+                    {
+                        children: [
+                            'earn',
+                            { children: ['PAGE', {}, null, null, refreshFlag] },
+                            null,
+                            null,
+                            refreshFlag
+                        ]
+                    },
+                    null,
+                    null,
+                    refreshFlag
+                ]
+            },
+            null,
+            null,
+            refreshFlag + 16
+        ];
+        return encodeURIComponent(JSON.stringify(tree));
+    }
+
+    function buildRewardsDeploymentId(html) {
+        return html.match(/[?&](?:amp;)?dpl=([A-Za-z0-9._-]+)/i)?.[1] ||
+            html.match(/\/_next\/static\/([A-Za-z0-9._-]+)\//)?.[1] || '';
+    }
+
+    async function getRewardsServerActionContext() {
+        if (rewardsActionContext) return rewardsActionContext;
+        if (rewardsActionUnavailable) throw new Error(rewardsActionUnavailable);
+        if (rewardsActionContextPromise) return rewardsActionContextPromise;
+
+        rewardsActionContextPromise = (async () => {
+            try {
+                const cookie = await getCookies('https://rewards.bing.com');
+                const [earnHtml, dashboardHtml] = await Promise.all([
+                    fetchRewardsText(REWARDS_ORIGIN + '/earn', 'text/html,application/xhtml+xml', cookie).catch(() => ''),
+                    fetchRewardsText(REWARDS_ORIGIN + '/dashboard', 'text/html,application/xhtml+xml', cookie).catch(() => '')
+                ]);
+                const htmlBundle = [earnHtml, dashboardHtml].filter(Boolean).join('\n');
+                if (!htmlBundle) throw new Error('Rewards 页面拉取失败');
+
+                const paths = new Set();
+                for (const match of htmlBundle.matchAll(/(?:\/_next\/)?(static\/chunks\/[\w\-./()]+?\.js)/g)) {
+                    paths.add('/_next/' + match[1]);
+                }
+
+                let jsTexts = await Promise.all([...paths].map(async path => {
+                    try {
+                        return await fetchRewardsText(REWARDS_ORIGIN + path, 'application/javascript,*/*', '');
+                    } catch (_) {
+                        return '';
+                    }
+                }));
+
+                const dynamicPaths = new Set();
+                for (const js of jsTexts) {
+                    if (!js) continue;
+                    for (const path of extractDynamicRewardsChunks(js)) dynamicPaths.add(path);
+                }
+                const moreTexts = await Promise.all([...dynamicPaths].slice(0, 80).map(async path => {
+                    try {
+                        return await fetchRewardsText(REWARDS_ORIGIN + path, 'application/javascript,*/*', '');
+                    } catch (_) {
+                        return '';
+                    }
+                }));
+                jsTexts = jsTexts.concat(moreTexts);
+
+                let actionId = '';
+                for (const js of jsTexts) {
+                    if (!js) continue;
+                    const ids = extractRewardsActionIds(js);
+                    actionId = ids.reportActivity ||
+                        Object.entries(ids).find(([name]) => /report.*activity|activity.*report/i.test(name))?.[1] ||
+                        actionId;
+                    if (actionId) break;
+                }
+                if (!actionId) throw new Error('未找到新版上报入口');
+
+                rewardsActionContext = {
+                    actionId,
+                    deploymentId: buildRewardsDeploymentId(earnHtml || dashboardHtml),
+                    routerStateTree: rewardsRouterStateTree(),
+                    cookie
+                };
+                log('🔑 已准备新版活动上报');
+                return rewardsActionContext;
+            } catch (e) {
+                rewardsActionUnavailable = e?.message || '新版上报入口不可用';
+                rewardsActionContextPromise = null;
+                throw e;
+            }
+        })();
+        return rewardsActionContextPromise;
+    }
+
+    async function reportWebActivityServerAction(item) {
+        const context = await getRewardsServerActionContext();
+        const rawActivityType = item.activityType ?? item.attributes?.activityType ?? item.attributes?.activity_type;
+        const parsedActivityType = Number(rawActivityType);
+        const activityType = Number.isInteger(parsedActivityType) && parsedActivityType > 0 ? parsedActivityType : 11;
+        const rawPromotional = item.attributes?.promotional ?? item.isPromotional;
+        const isPromotional = rawPromotional === true || String(rawPromotional).toLowerCase() === 'true';
+        const body = JSON.stringify([
+            item.hash,
+            activityType,
+            {
+                offerid: item.offerId,
+                isPromotional: isPromotional ? true : '$undefined',
+                timezoneOffset: new Date().getTimezoneOffset()
+            }
+        ]);
+
+        try {
+            const response = await gmRequest({
+                method: 'POST',
+                url: REWARDS_ORIGIN + '/earn',
+                headers: {
+                    Accept: 'text/x-component',
+                    'Content-Type': 'text/plain;charset=UTF-8',
+                    Origin: REWARDS_ORIGIN,
+                    Referer: REWARDS_ORIGIN + '/earn',
+                    'Next-Action': context.actionId,
+                    'Next-Router-State-Tree': context.routerStateTree,
+                    ...(context.deploymentId ? { 'X-Deployment-Id': context.deploymentId } : {}),
+                    ...(context.cookie ? { Cookie: context.cookie } : {})
+                },
+                data: body,
+                anonymous: !!context.cookie
+            });
+            if (!/^\d+:true\s*$/m.test(String(response || ''))) throw new Error('新版上报未确认');
+            return true;
+        } catch (e) {
+            if (e?.status === 401 || e?.status === 403) rewardsActionContext = null;
+            const message = '新版上报' + (e?.status ? ` HTTP ${e.status}` : `：${e?.message || '失败'}`);
+            if (e?.status !== 401 && e?.status !== 403 && e?.status !== 429) rewardsActionUnavailable = message;
+            throw new Error(message);
+        }
+    }
+
     // ===== 在 rewards 页面 DOM 里真实点击每日活动子卡（方案 B：模拟人工点击，绕过 rnoreward=1 不计分问题）=====
     // 关键经验（来自 Kimi WebBridge 实战）：每日活动子卡 URL 带 rnoreward=1，奖励由"点击卡片"发放，
     // 而非访问 href。navigate / fetch /reportactivity 全部不计分。必须真实 .click() 卡片元素。
@@ -2400,7 +2601,8 @@
                                 data: `id=${encodeURIComponent(p.offerId)}&hash=${encodeURIComponent(p.hash)}&activityAmount=1&__RequestVerificationToken=${encodeURIComponent(token)}`
                             });
                         } else {
-                            throw new Error('无活动Token且不是站内链接');
+                            // 新版 Rewards 面板不再稳定提供旧版 RequestVerificationToken。
+                            await reportWebActivityServerAction(p);
                         }
 
                         // 请求2: V1 API（仅 quiz 类辅助触发；失败不影响主流程）
