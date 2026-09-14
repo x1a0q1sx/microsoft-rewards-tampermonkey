@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.38
+// @version      1.0.1.39
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.38';
+        const SCRIPT_VERSION = '1.0.1.39';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -2508,7 +2508,7 @@
 
         // ===== web 路径 =====
         if (webItems.length) {
-        const pageItems = webItems.filter(isPageClickItem);
+        const pageItems = webItems.filter(p => p.destinationUrl);
         if (pageItems.length) {
             // 无论当前是否已在 rewards 页，都先保存待办，防止点击或导航导致脚本上下文被卸载。
             savePendingPromo(webItems);
@@ -2522,8 +2522,7 @@
                 return;
             }
         }
-        // 站内 urlreward 活动（destinationUrl 指向 bing.com）通过 POST /earn Server Action 完成，无需 token；
-        // 仅对非站内（rewards.bing.com 子活动页）才预取 token 走 reportactivity 上报。
+        // 有目标链接的活动优先点击 Rewards 页面里的任务卡；只有无卡片/无链接时才走接口兜底。
         let token = null;
         const nonSiteItems = webItems.filter(p => p.destinationUrl && !/^https?:\/\/(www\.|cn\.)bing\.com\//i.test(p.destinationUrl));
         if (nonSiteItems.length) {
@@ -2558,13 +2557,11 @@
             await waitWhilePaused();
             const ptype = (p.type || p.completionType || p.attributes?.type || '').toLowerCase();
             const isQuiz = ptype.includes('quiz');
-            // 站内判定：destinationUrl 指向 bing.com 站内（UrlOffer/搜索/拼图），官方"点击进入即完成"，无需 token
-            const isBingSite = isPageClickItem(p);
-            // 每日任务集项 pointProgressMax 多为 10；dapi 已证明无效，web reportactivity 才是正解。
-            // 每次上报可能只 +1 进度，故按"剩余量"发足次数（多则前几次即完成，后续为空操作）；上限 12。
+            // Kimi/WebBridge 实测：带 destinationUrl 的任务卡必须真实点击才稳定计分，
+            // 直接导航或接口上报都可能不回写进度。
+            const canPageClick = !!p.destinationUrl;
             let need = 1;
-            if (isBingSite) {
-                // 站内 urlreward/搜索：真实打开页面一次即完成（页面 JS 自动上报）
+            if (canPageClick) {
                 need = 1;
             } else if (token && p.pointProgressMax && p.pointProgressMax > (p.pointProgress || 0)) {
                 const remain = p.pointProgressMax - (p.pointProgress || 0);
@@ -2581,9 +2578,7 @@
 
                     for (let k = 0; k < need; k++) {
                         await waitWhilePaused();
-                        if (isBingSite && p.destinationUrl) {
-                            // 站内 urlreward 活动：rnoreward=1 卡片必须真实点击才计分（navigate/fetch 均不计分）。
-                            // 改为在当前 rewards 页面 DOM 内定位并 click 卡片元素（方案 B：模拟人工点击）。
+                        if (canPageClick) {
                             const clicked = await clickActivityCardOnPage(p);
                             if (!clicked) throw new Error('未命中活动卡片');
                         } else if (token) {
