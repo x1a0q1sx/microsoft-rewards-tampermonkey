@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.40
+// @version      1.0.1.41
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.40';
+        const SCRIPT_VERSION = '1.0.1.41';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -589,6 +589,8 @@
             if (m && m[1]) return safeDecodeAuthCode(m[1]);
         }
         const c = raw.split(/[&\s]/)[0].trim();          // 直接粘贴的裸 code
+        // 回调页消费 code 后可能变成 ...?removed=true；这不是授权码，不能当 code 兑换。
+        if (/^https?:\/\//i.test(c) && !c.includes('code=')) return null;
         return c || null;
     }
 
@@ -2855,6 +2857,11 @@
     // 点完“获取授权码”跳到该页后，无需手动复制 URL，脚本自动提取并换取令牌
     (function autoCaptureAuth() {
         try {
+            const staleAuthCode = GM_getValue('auth_code');
+            if (staleAuthCode && /^https?:\/\//i.test(staleAuthCode) && !staleAuthCode.includes('code=')) {
+                GM_setValue('auth_code', '');
+                GM_setValue('auth_code_claim', '');
+            }
             const code = extractAuthCode(location.href);
             // 同一废 code 不要反复捕获兑换（避免刷新该页面时死循环）
             if (code && GM_getValue('auth_code_bad') !== code) {
