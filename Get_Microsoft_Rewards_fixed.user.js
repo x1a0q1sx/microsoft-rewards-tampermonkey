@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.39
+// @version      1.0.1.40
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.39';
+        const SCRIPT_VERSION = '1.0.1.40';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -2508,7 +2508,7 @@
 
         // ===== web 路径 =====
         if (webItems.length) {
-        const pageItems = webItems.filter(p => p.destinationUrl);
+        const pageItems = webItems;
         if (pageItems.length) {
             // 无论当前是否已在 rewards 页，都先保存待办，防止点击或导航导致脚本上下文被卸载。
             savePendingPromo(webItems);
@@ -2557,9 +2557,9 @@
             await waitWhilePaused();
             const ptype = (p.type || p.completionType || p.attributes?.type || '').toLowerCase();
             const isQuiz = ptype.includes('quiz');
-            // Kimi/WebBridge 实测：带 destinationUrl 的任务卡必须真实点击才稳定计分，
+            // Kimi/WebBridge 实测：Rewards 页里的任务卡必须真实点击才稳定计分，
             // 直接导航或接口上报都可能不回写进度。
-            const canPageClick = !!p.destinationUrl;
+            const canPageClick = true;
             let need = 1;
             if (canPageClick) {
                 need = 1;
