@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.41
+// @version      1.0.1.42
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.41';
+        const SCRIPT_VERSION = '1.0.1.42';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -713,6 +713,48 @@
         });
     }
 
+    // Chrome 里旧版 Rewards API 可能拿不到 userStatus；SAAndroid 又不给 PC 计数器。
+    // Bing Flyout 是浏览器侧数据源，能补上 PCSearch/MobileSearch。
+    async function fetchDashboardViaBingFlyout() {
+        const cookie = await getCookies('https://www.bing.com');
+        const raw = await gmRequest({
+            url: `https://www.bing.com/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards&_=${Date.now()}`,
+            headers: {
+                Accept: 'application/json',
+                Referer: 'https://www.bing.com/',
+                Origin: 'https://www.bing.com',
+                'X-Requested-With': 'XMLHttpRequest',
+                ...(cookie ? { Cookie: cookie } : {})
+            },
+            anonymous: !!cookie
+        });
+        const flyout = JSON.parse(raw);
+        const status = flyout?.flyoutResult?.userStatus;
+        const profile = flyout?.userInfo?.profile;
+        const counters = status?.counters;
+        if (!flyout?.userInfo?.isRewardsUser || !status?.isRewardsUser || !counters) {
+            throw new Error('Bing Flyout 未返回完整账户数据');
+        }
+        return {
+            profile,
+            dashboard: {
+                ...flyout.flyoutResult,
+                userStatus: {
+                    ...status,
+                    availablePoints: status.availablePoints ?? flyout.userInfo.balance ?? 0,
+                    counters: {
+                        pcSearch: counters.PCSearch ?? counters.pcSearch ?? [],
+                        mobileSearch: counters.MobileSearch ?? counters.mobileSearch ?? [],
+                        activityAndQuiz: counters.ActivityAndQuiz ?? counters.activityAndQuiz ?? [],
+                        dailyPoint: counters.DailyPoint ?? counters.dailyPoint ?? []
+                    }
+                },
+                dailySetPromotions: flyout.flyoutResult?.dailySetPromotions ?? {},
+                morePromotions: flyout.flyoutResult?.morePromotions ?? []
+            }
+        };
+    }
+
     // 归一化 promotion 列表，兼容两种返回结构
     function normalizePromotions(dash, data) {
         const d = new Date();
@@ -791,6 +833,16 @@
                     }
                 } catch (e) {
                     if (e.status !== 401) log('🍪 getuserinfo: ' + e.message);
+                }
+
+                // Bing Flyout 兜底：Chrome 下旧 API/移动 API 可能缺失 PCSearch 计数器
+                if (!data) {
+                    try {
+                        data = await fetchDashboardViaBingFlyout();
+                        source = 'BingFlyout';
+                    } catch (e) {
+                        log('⚠️ Bing Flyout 数据获取失败: ' + e.message);
+                    }
                 }
 
                 // === 调试：确认 dailySetPromotions 实际位置与每日任务集字段 ===
