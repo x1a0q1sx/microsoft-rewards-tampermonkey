@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.42
+// @version      1.0.1.43
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.42';
+        const SCRIPT_VERSION = '1.0.1.43';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -2940,6 +2940,18 @@
             startAutoCloseActivityTabMonitor();
             loginCookie = await getCookies('https://login.live.com');
             await updateData();
+            // 青龙/计划任务自动执行入口：
+            // 用 Edge 打开 https://rewards.bing.com/?mr_auto_run=1 时，
+            // 油猴脚本在数据就绪后自动点击“一键全部执行”，无需人工点悬浮窗。
+            const autoRun = new URLSearchParams(location.search).get('mr_auto_run');
+            if (autoRun === '1' && isRewardsPage()) {
+                setTimeout(() => {
+                    if (!state.allRunning && !state.running && nodes.btnAll && nodes.btnAll.textContent.includes('一键全部执行')) {
+                        log('⚙️ 检测到自动执行参数，开始一键任务...');
+                        nodes.btnAll.click();
+                    }
+                }, 2500);
+            }
             // Try load read progress if token exists
             try {
                 const info = await withAccessTokenRequest(token => gmRequest({
