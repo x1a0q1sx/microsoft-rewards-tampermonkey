@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.46
+// @version      1.0.1.47
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.46';
+        const SCRIPT_VERSION = '1.0.1.47';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -1005,16 +1005,14 @@
 
                 // 今日积分优先使用 counters（搜索/活动计数本身就是当日累计积分）；
                 // 如果 API 不返回 counters，再退回活动进度和余额快照。
-                let todayEarned = 0;
-                let todayEarnedSource = '';
-                if (c && typeof c === 'object') {
-                    Object.values(c).forEach(arr => {
-                        if (Array.isArray(arr)) arr.forEach(item => {
-                            todayEarned += Number(item?.pointProgress ?? item?.progress ?? 0) || 0;
-                        });
-                    });
+                // dailyPoint 是当天总积分计数器，优先使用它；没有时再用分类计数器相加。
+                const sumProgress = arr => Array.isArray(arr) ? arr.reduce((sum, item) => sum + (Number(item?.pointProgress ?? item?.progress ?? 0) || 0), 0) : 0;
+                let todayEarned = sumProgress(c.dailyPoint || c.DailyPoint);
+                let todayEarnedSource = todayEarned ? 'dailyPoint' : '';
+                if (!todayEarned) {
+                    todayEarned = pc + mob + sumProgress(c.activityAndQuiz || c.ActivityAndQuiz);
+                    if (todayEarned > 0) todayEarnedSource = 'counters';
                 }
-                if (todayEarned > 0) todayEarnedSource = 'counters';
                 if (!todayEarned) {
                     todayEarned = allP.reduce((sum, p) => sum + (Number(p.pointProgress ?? p.attributes?.progress ?? 0) || 0), 0);
                     if (todayEarned > 0) todayEarnedSource = 'promotions';
