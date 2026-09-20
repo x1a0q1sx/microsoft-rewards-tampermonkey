@@ -1,0 +1,3 @@
+# 每天早上 07:30 启动 Edge，执行油猴脚本一键任务。
+# 把下面的 ID 改成你青龙面板中该任务的实际 ID，log_name 可以保留。
+30 7 * * * real_time=false no_tee=true ID=2 log_name=mr_rewards_auto task mr_rewards_auto.py

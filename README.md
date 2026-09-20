@@ -46,11 +46,7 @@ https://rewards.bing.com/?mr_auto_run=1
 
 脚本检测到 `mr_auto_run=1` 后，会自动点击悬浮窗中的“一键全部执行”。浏览器窗口需要保持打开，脚本会在页面内继续执行。
 
-青龙示例命令：
-
-```python
-start "" "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --new-window https://rewards.bing.com/?mr_auto_run=1
-```
+青龙面板相关文件与教程位于：[qinglong/README.md](qinglong/README.md)。
 
 如果 Edge 打开 Rewards 页面时下载 `Clear.PNG`，通常是下载类扩展拦截了微软埋点资源。优先在 `edge://extensions` 中临时禁用“迅雷下载支持”等下载扩展；这类扩展可能会干扰页面脚本注入。
 
@@ -67,6 +63,15 @@ pause: {
 ```
 
 当前默认设置为每完成 10 次搜索后暂停 1 分钟。活动失败时最多尝试 3 次（首次执行加 2 次重试）。
+
+## 搜索额度说明
+
+`PC x/y` 和 `移动 x/y` 不是固定值，Microsoft 会根据账号地区、浏览器客户端、登录态和每日完成情况返回不同计数器。
+
+- PC 搜索：Edge 通常能看到浏览器侧 `PCSearch` 计数器；Chrome 不一定有同样额度。脚本会先尝试 Rewards API 和 Bing Flyout，仍拿不到计数器时会显示“无搜索额度”。
+- 移动搜索：多数情况下需要 Bing 移动端 App 或真实移动端场景，桌面浏览器不能可靠完成。
+- 每天 0 点后额度重置。如果之前有、现在没有，先看是否已经完成，或刷新 Rewards 仪表板确认当日进度。
+- 新版脚本会输出一行 `搜索额度：PC ... | 移动 ... | 来源 ...`，可用于判断是微软没返回，还是浏览器/地区限制。
 
 ## 常见问题
 

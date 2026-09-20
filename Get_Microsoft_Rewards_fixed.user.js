@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.44
+// @version      1.0.1.45
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.44';
+        const SCRIPT_VERSION = '1.0.1.45';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -120,6 +120,8 @@
     let autoCloseTabMode = false;
     let autoCloseMarkerKind = '';
     let lastDataLogSignature = '';
+    let lastDashboardSource = '';
+    let lastQuotaLogSignature = '';
 
     // ========== 进度保存/恢复 ==========
     const STORAGE_KEY = 'mr_search_progress';
@@ -839,7 +841,7 @@
                     }
                     if (r) {
                         const d = JSON.parse(r);
-                        if (d && (d.dashboard?.userStatus || d.response?.userStatus)) { data = d; source = 'cookie'; }
+                        if (d && (d.dashboard?.userStatus || d.response?.userStatus)) { data = d; source = 'cookie'; lastDashboardSource = source; }
                     } else if (lastErr && lastErr.status !== 401) {
                         log('🍪 getuserinfo: ' + lastErr.message);
                     }
@@ -852,6 +854,7 @@
                     try {
                         data = await fetchDashboardViaBingFlyout();
                         source = 'BingFlyout';
+                        lastDashboardSource = source;
                     } catch (e) {
                         log('⚠️ Bing Flyout 数据获取失败: ' + e.message);
                     }
@@ -916,7 +919,7 @@
                                 // dapi/me 用 balance/counters/promotions 结构（无 userStatus），需一并接受
                                 if (d && (rr?.userStatus || d.dashboard?.userStatus ||
                                           (rr && (rr.balance !== undefined || rr.counters || rr.promotions)))) {
-                                    data = d; source = 'Bearer'; break;
+                                    data = d; source = 'Bearer'; lastDashboardSource = source; break;
                                 }
                                 const topKeys = d ? Object.keys(d).join(',') : '(空)';
                                 const respKeys = rr ? Object.keys(rr).join(',') : '(无 response)';
@@ -976,6 +979,12 @@
 
                 state.pcCur = pc; state.pcMax = pcM;
                 state.mobileCur = mob; state.mobileMax = mobM;
+
+                const quotaLog = `⚠️ 搜索额度：PC ${pc}/${pcM}（${state.pcSearchOk ? '有计数器' : '无计数器'}） | 移动 ${mob}/${mobM}（${state.mobSearchOk ? '有计数器' : '无计数器'}） | 来源 ${lastDashboardSource || 'unknown'}`;
+                if (quotaLog !== lastQuotaLogSignature) {
+                    lastQuotaLogSignature = quotaLog;
+                    log(quotaLog);
+                }
 
                 // promotion 列表：cookie schema 用 dashboard.dailySet/more；dapi schema 用 response.promotions
                 dashboard = dashCookie || resp;
@@ -2996,13 +3005,18 @@
             }
         } catch { }
         try {
-            GM_setValue('mr_last_run_debug', JSON.stringify({
-                version: SCRIPT_VERSION,
-                time: new Date().toISOString(),
-                url: location.href,
-                panel: !!document.getElementById('mr-panel'),
-                body: !!document.body
-            }));
+                GM_setValue('mr_last_run_debug', JSON.stringify({
+                    version: SCRIPT_VERSION,
+                    time: new Date().toISOString(),
+                    url: location.href,
+                    panel: !!document.getElementById('mr-panel'),
+                    body: !!document.body,
+                    source: lastDashboardSource,
+                    pc: `${state.pcCur}/${state.pcMax}`,
+                    mobile: `${state.mobileCur}/${state.mobileMax}`,
+                    pcOk: state.pcSearchOk,
+                    mobileOk: state.mobSearchOk
+                }));
         } catch (_) {}
         log('🌟 脚本就绪 v' + SCRIPT_VERSION);
     })();
