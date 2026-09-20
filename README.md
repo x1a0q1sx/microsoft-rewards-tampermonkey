@@ -36,6 +36,24 @@
 
 首次使用建议先手动观察一次运行过程，确认账号地区、任务类型和浏览器行为符合预期。
 
+## 定时自动执行
+
+油猴脚本不能脱离浏览器直接运行。若需要用青龙面板、Windows 任务计划程序或系统定时器触发，建议让定时任务启动 Edge 并打开：
+
+```text
+https://rewards.bing.com/?mr_auto_run=1
+```
+
+脚本检测到 `mr_auto_run=1` 后，会自动点击悬浮窗中的“一键全部执行”。浏览器窗口需要保持打开，脚本会在页面内继续执行。
+
+青龙示例命令：
+
+```python
+start "" "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --new-window https://rewards.bing.com/?mr_auto_run=1
+```
+
+如果 Edge 打开 Rewards 页面时下载 `Clear.PNG`，通常是下载类扩展拦截了微软埋点资源。优先在 `edge://extensions` 中临时禁用“迅雷下载支持”等下载扩展；这类扩展可能会干扰页面脚本注入。
+
 ## 配置
 
 脚本中的配置位于 `CONFIG` 对象，例如：
