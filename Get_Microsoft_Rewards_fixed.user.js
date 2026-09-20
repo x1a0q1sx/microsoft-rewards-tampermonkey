@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.48
+// @version      1.0.1.49
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.48';
+        const SCRIPT_VERSION = '1.0.1.49';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -705,16 +705,30 @@
 
     // 方式1：rewards.bing.com 会话 cookie（原逻辑，显式带 cookie 更稳）
     async function fetchDashboardViaCookie() {
+        const url = `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${Date.now()}`;
+        const headers = {
+            Accept: 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            Referer: 'https://rewards.bing.com/'
+        };
+        // 当前页面已经在 rewards.bing.com 时，用页面同源 fetch 才能稳定带上登录 Cookie。
+        if (location.origin === 'https://rewards.bing.com') {
+            try {
+                const r = await fetch(url, { headers, credentials: 'include', cache: 'no-store' });
+                const t = await r.text();
+                if (r.ok && t && t.startsWith('{')) return t;
+            } catch (_) {}
+        }
         const cookie = await getCookies('https://rewards.bing.com');
         return await gmRequest({
-            url: `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${Date.now()}`,
+            url,
             headers: {
-                'X-Requested-With': 'XMLHttpRequest',
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'Referer': 'https://rewards.bing.com/',
-                ...(cookie ? { 'Cookie': cookie } : {})
+                ...headers,
+                ...(cookie ? { Cookie: cookie } : {})
             },
-            anonymous: false
+            anonymous: false,
+            retries: 0
         });
     }
 
@@ -736,10 +750,17 @@
     // Bing Flyout 是浏览器侧数据源，能补上 PCSearch/MobileSearch。
     function mapBingFlyoutData(flyout) {
         const status = flyout?.flyoutResult?.userStatus;
-        const profile = flyout?.userInfo?.profile;
+        const profile = flyout?.profile || flyout?.userInfo?.profile;
         const counters = status?.counters;
-        if (!counters) {
+        if (!status || !counters) {
             throw new Error('Bing Flyout 未返回完整账户数据');
+        }
+        const nonuser = String(profile?.attributes?.nonuser || '').toLowerCase() === 'true';
+        const hasCounterData = Object.values(counters).some(arr =>
+            Array.isArray(arr) && arr.some(x => Number(x?.pointProgressMax ?? 0) > 0 || Number(x?.pointProgress ?? 0) > 0)
+        );
+        if (nonuser || !hasCounterData) {
+            throw new Error('Bing Flyout 返回游客/空账户数据');
         }
         return {
             profile,
@@ -761,30 +782,42 @@
         };
     }
 
-    async function fetchDashboardViaBingFlyout() {
-        const attempts = [];
-        // 先信任浏览器自己的 Cookie 容器；再按域名显式带 Cookie；最后兼容 cn 域名。
-        for (const host of ['www.bing.com', 'cn.bing.com']) {
-            attempts.push({ host, cookie: '' });
-            attempts.push({ host, cookie: await getCookies(`https://${host}`) });
+    async function requestBingFlyoutOnce(url) {
+        const u = new URL(url);
+        const headers = {
+            Accept: 'application/json',
+            Referer: `${u.origin}/`,
+            Origin: u.origin,
+            'X-Requested-With': 'XMLHttpRequest'
+        };
+        if (location.origin === u.origin) {
+            const r = await fetch(url, { headers, credentials: 'include', cache: 'no-store' });
+            const t = await r.text();
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return t;
         }
+        const cookie = await getCookies(u.origin);
+        return await gmRequest({
+            url,
+            headers: { ...headers, ...(cookie ? { Cookie: cookie } : {}) },
+            anonymous: !!cookie,
+            retries: 0
+        });
+    }
+
+    async function fetchDashboardViaBingFlyout() {
+        const qs = `channel=BingFlyout&partnerId=BingRewards&_=${Date.now()}`;
+        const candidates = [];
+        if (location.hostname === 'rewards.bing.com') {
+            candidates.push(`${location.origin}/rewards/panelflyout/getuserinfo?${qs}`);
+        }
+        candidates.push(`https://www.bing.com/rewards/panelflyout/getuserinfo?${qs}`);
+        candidates.push(`https://cn.bing.com/rewards/panelflyout/getuserinfo?${qs}`);
 
         let lastError = null;
-        for (const attempt of attempts) {
+        for (const url of candidates) {
             try {
-                const raw = await gmRequest({
-                    url: `https://${attempt.host}/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards&_=${Date.now()}`,
-                    headers: {
-                        Accept: 'application/json',
-                        Referer: `https://${attempt.host}/`,
-                        Origin: `https://${attempt.host}`,
-                        'X-Requested-With': 'XMLHttpRequest',
-                        ...(attempt.cookie ? { Cookie: attempt.cookie } : {})
-                    },
-                    anonymous: !!attempt.cookie,
-                    retries: 0
-                });
-                return mapBingFlyoutData(JSON.parse(raw));
+                return mapBingFlyoutData(JSON.parse(await requestBingFlyoutOnce(url)));
             } catch (e) {
                 lastError = e;
             }
