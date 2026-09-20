@@ -10,13 +10,13 @@
 启动 Edge 并打开 https://rewards.bing.com/?mr_auto_run=1
 ```
 
-油猴脚本 `Get Microsoft Rewards v1.0.1.45+` 检测到 `mr_auto_run=1` 后，会自动点击悬浮窗里的“一键全部执行”。
+油猴脚本 `Get Microsoft Rewards v1.0.1.49+` 检测到 `mr_auto_run=1` 后，会自动点击悬浮窗里的“一键全部执行”。
 
 ## 前提
 
 1. 电脑已登录 Microsoft Rewards，并且 Edge 里保留登录态。
 2. Edge 已安装 Tampermonkey。
-3. Edge Tampermonkey 已安装本仓库脚本，且版本为 `1.0.1.45` 或更高。
+3. Edge Tampermonkey 已安装本仓库脚本，且版本为 `1.0.1.49` 或更高。
 4. 如果 Edge 打开 `/earn` 时下载 `Clear.PNG`，先禁用“迅雷下载支持”等下载类扩展；它们可能拦截微软埋点资源并干扰页面。
    可使用仓库内的 `../tools/disable-edge-thunder.bat`，恢复时运行 `../tools/enable-edge-thunder.bat`。
 
