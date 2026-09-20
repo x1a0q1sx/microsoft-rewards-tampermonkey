@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.45
+// @version      1.0.1.46
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.45';
+        const SCRIPT_VERSION = '1.0.1.46';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -77,6 +77,7 @@
         signDone: false, signPoints: -1,
         readCur: 0, readMax: 0,
         pcSearchOk: true, mobSearchOk: true, // 账户是否具备 PC/移动 搜索额度（区域限制自动检测）
+        todayEarned: 0, todayEarnedSource: '',
         running: false,
         accessToken: null,
         accessTokenExpiresAt: 0,
@@ -101,6 +102,7 @@
     const PENDING_PROMO_KEY = 'mr_pending_promo';
     const PROMO_RESUME_KEY = 'mr_promo_resume_intent';
     const DAILY_STREAK_STATE_KEY = 'mr_daily_streak_state';
+    const DAILY_POINTS_KEY = 'mr_daily_points';
     const AUTO_CLOSE_TAB_KEY = 'mr_auto_close_activity_tabs';
     const AUTO_CLOSE_TAB_PREFIX = '__MR_AUTO_CLOSE_ACTIVITY__:';
     // 默认只在悬浮窗显示关键结果；完整诊断仍保留在代码中，排障时可改为 true。
@@ -426,6 +428,8 @@
                 </div>
 
                 <!-- 进度 -->
+                <div class="mr-row"><span>💰 今日积分</span><span id="mr-today" style="font-weight:600;color:#0078d4">+0</span></div>
+
                 <div class="mr-row"><span>💻 PC搜索</span><span id="mr-pc">0/0</span></div>
                 <div class="mr-progress-bg"><div class="mr-bar" id="mr-pc-bar"></div></div>
 
@@ -483,6 +487,7 @@
         btnSearch: $('#btn-search'),
         btnPromo: $('#btn-promo'),
         valPromo: $('#val-promo'),
+        today: $('#mr-today'),
         btnSign: $('#btn-sign'),
         btnRead: $('#btn-read'),
         btnAll: $('#btn-all'),
@@ -998,10 +1003,46 @@
                 state.promosTotal = allP.length;
                 state.promosDone = allP.filter(isDone).length;
 
+                // 今日积分优先使用 counters（搜索/活动计数本身就是当日累计积分）；
+                // 如果 API 不返回 counters，再退回活动进度和余额快照。
+                let todayEarned = 0;
+                let todayEarnedSource = '';
+                if (c && typeof c === 'object') {
+                    Object.values(c).forEach(arr => {
+                        if (Array.isArray(arr)) arr.forEach(item => {
+                            todayEarned += Number(item?.pointProgress ?? item?.progress ?? 0) || 0;
+                        });
+                    });
+                }
+                if (todayEarned > 0) todayEarnedSource = 'counters';
+                if (!todayEarned) {
+                    todayEarned = allP.reduce((sum, p) => sum + (Number(p.pointProgress ?? p.attributes?.progress ?? 0) || 0), 0);
+                    if (todayEarned > 0) todayEarnedSource = 'promotions';
+                }
+
+                try {
+                    const rawPointsSnap = GM_getValue(DAILY_POINTS_KEY);
+                    const today = getDateHyphen();
+                    let pointsSnap = rawPointsSnap ? JSON.parse(rawPointsSnap) : null;
+                    if (!pointsSnap || pointsSnap.date !== today) {
+                        pointsSnap = { date: today, initial: state.points, max: state.points };
+                    }
+                    pointsSnap.max = Math.max(Number(pointsSnap.max) || 0, state.points);
+                    GM_setValue(DAILY_POINTS_KEY, JSON.stringify(pointsSnap));
+                    const balanceEarned = Math.max(0, pointsSnap.max - pointsSnap.initial);
+                    if (!todayEarned && balanceEarned > 0) {
+                        todayEarned = balanceEarned;
+                        todayEarnedSource = 'balance';
+                    }
+                } catch (_) {}
+
+                state.todayEarned = todayEarned;
+                state.todayEarnedSource = todayEarnedSource || 'unavailable';
+
                 state.authNeeded = false;
                 nodes.boxAuth.style.display = 'none';
                 render();
-                const dataLog = `✓ 数据已更新: Lv.${state.level} ${state.points}pts | PC ${pc}/${pcM} 移动 ${mob}/${mobM} 活动 ${state.promosDone}/${state.promosTotal}`;
+                const dataLog = `✓ 数据已更新: Lv.${state.level} ${state.points}pts | 今日 +${state.todayEarned} | PC ${pc}/${pcM} 移动 ${mob}/${mobM} 活动 ${state.promosDone}/${state.promosTotal}`;
                 if (dataLog !== lastDataLogSignature) {
                     lastDataLogSignature = dataLog;
                     log(dataLog);
@@ -1020,6 +1061,7 @@
     function render() {
         nodes.level.textContent = `Lv.${state.level}`;
         nodes.points.textContent = state.points.toLocaleString();
+        if (nodes.today) nodes.today.textContent = `+${state.todayEarned}`;
 
         if (state.pcSearchOk === false) {
             nodes.pc.textContent = '无搜索额度';
@@ -3015,7 +3057,9 @@
                     pc: `${state.pcCur}/${state.pcMax}`,
                     mobile: `${state.mobileCur}/${state.mobileMax}`,
                     pcOk: state.pcSearchOk,
-                    mobileOk: state.mobSearchOk
+                    mobileOk: state.mobSearchOk,
+                    todayEarned: state.todayEarned,
+                    todayEarnedSource: state.todayEarnedSource
                 }));
         } catch (_) {}
         log('🌟 脚本就绪 v' + SCRIPT_VERSION);
