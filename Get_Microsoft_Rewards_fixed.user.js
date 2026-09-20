@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.43
+// @version      1.0.1.44
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.43';
+        const SCRIPT_VERSION = '1.0.1.44';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -311,7 +311,11 @@
         #mr-panel {
             position: fixed;
             bottom: 20px;
-            right: 20px;
+            left: 20px;
+            right: auto;
+            display: block;
+            min-width: 44px;
+            min-height: 44px;
             z-index: 2147483647;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: #fff;
@@ -451,7 +455,15 @@
             </div>
         </div>
     `;
-    document.body.appendChild(panel);
+    const mountPanel = () => {
+        const target = document.body || document.documentElement;
+        if (target && !target.querySelector('#mr-panel')) target.appendChild(panel);
+    };
+    mountPanel();
+    // Rewards 是 React 页面，偶尔会在首屏后续重绘中移除脚本节点；这里自动补回。
+    new MutationObserver(() => {
+        if (!document.getElementById('mr-panel')) mountPanel();
+    }).observe(document.documentElement, { childList: true, subtree: true });
 
     // 元素引用
     const $ = id => document.querySelector(id);
@@ -2983,6 +2995,15 @@
                 log('ℹ️ 有未完成活动待办；请点击“活动”或“一键全部执行”后继续。');
             }
         } catch { }
+        try {
+            GM_setValue('mr_last_run_debug', JSON.stringify({
+                version: SCRIPT_VERSION,
+                time: new Date().toISOString(),
+                url: location.href,
+                panel: !!document.getElementById('mr-panel'),
+                body: !!document.body
+            }));
+        } catch (_) {}
         log('🌟 脚本就绪 v' + SCRIPT_VERSION);
     })();
 
