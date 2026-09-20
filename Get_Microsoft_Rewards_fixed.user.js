@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.47
+// @version      1.0.1.48
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.47';
+        const SCRIPT_VERSION = '1.0.1.48';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -734,24 +734,11 @@
 
     // Chrome 里旧版 Rewards API 可能拿不到 userStatus；SAAndroid 又不给 PC 计数器。
     // Bing Flyout 是浏览器侧数据源，能补上 PCSearch/MobileSearch。
-    async function fetchDashboardViaBingFlyout() {
-        const cookie = await getCookies('https://www.bing.com');
-        const raw = await gmRequest({
-            url: `https://www.bing.com/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards&_=${Date.now()}`,
-            headers: {
-                Accept: 'application/json',
-                Referer: 'https://www.bing.com/',
-                Origin: 'https://www.bing.com',
-                'X-Requested-With': 'XMLHttpRequest',
-                ...(cookie ? { Cookie: cookie } : {})
-            },
-            anonymous: !!cookie
-        });
-        const flyout = JSON.parse(raw);
+    function mapBingFlyoutData(flyout) {
         const status = flyout?.flyoutResult?.userStatus;
         const profile = flyout?.userInfo?.profile;
         const counters = status?.counters;
-        if (!flyout?.userInfo?.isRewardsUser || !status?.isRewardsUser || !counters) {
+        if (!counters) {
             throw new Error('Bing Flyout 未返回完整账户数据');
         }
         return {
@@ -772,6 +759,37 @@
                 morePromotions: flyout.flyoutResult?.morePromotions ?? []
             }
         };
+    }
+
+    async function fetchDashboardViaBingFlyout() {
+        const attempts = [];
+        // 先信任浏览器自己的 Cookie 容器；再按域名显式带 Cookie；最后兼容 cn 域名。
+        for (const host of ['www.bing.com', 'cn.bing.com']) {
+            attempts.push({ host, cookie: '' });
+            attempts.push({ host, cookie: await getCookies(`https://${host}`) });
+        }
+
+        let lastError = null;
+        for (const attempt of attempts) {
+            try {
+                const raw = await gmRequest({
+                    url: `https://${attempt.host}/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards&_=${Date.now()}`,
+                    headers: {
+                        Accept: 'application/json',
+                        Referer: `https://${attempt.host}/`,
+                        Origin: `https://${attempt.host}`,
+                        'X-Requested-With': 'XMLHttpRequest',
+                        ...(attempt.cookie ? { Cookie: attempt.cookie } : {})
+                    },
+                    anonymous: !!attempt.cookie,
+                    retries: 0
+                });
+                return mapBingFlyoutData(JSON.parse(raw));
+            } catch (e) {
+                lastError = e;
+            }
+        }
+        throw lastError || new Error('Bing Flyout 请求失败');
     }
 
     // 归一化 promotion 列表，兼容两种返回结构
@@ -1014,25 +1032,9 @@
                     if (todayEarned > 0) todayEarnedSource = 'counters';
                 }
                 if (!todayEarned) {
-                    todayEarned = allP.reduce((sum, p) => sum + (Number(p.pointProgress ?? p.attributes?.progress ?? 0) || 0), 0);
-                    if (todayEarned > 0) todayEarnedSource = 'promotions';
+                    // 没有 dailyPoint/分类计数器时宁可不显示，避免把总余额差当今日积分。
+                    todayEarnedSource = 'unavailable';
                 }
-
-                try {
-                    const rawPointsSnap = GM_getValue(DAILY_POINTS_KEY);
-                    const today = getDateHyphen();
-                    let pointsSnap = rawPointsSnap ? JSON.parse(rawPointsSnap) : null;
-                    if (!pointsSnap || pointsSnap.date !== today) {
-                        pointsSnap = { date: today, initial: state.points, max: state.points };
-                    }
-                    pointsSnap.max = Math.max(Number(pointsSnap.max) || 0, state.points);
-                    GM_setValue(DAILY_POINTS_KEY, JSON.stringify(pointsSnap));
-                    const balanceEarned = Math.max(0, pointsSnap.max - pointsSnap.initial);
-                    if (!todayEarned && balanceEarned > 0) {
-                        todayEarned = balanceEarned;
-                        todayEarnedSource = 'balance';
-                    }
-                } catch (_) {}
 
                 state.todayEarned = todayEarned;
                 state.todayEarnedSource = todayEarnedSource || 'unavailable';
@@ -1040,7 +1042,8 @@
                 state.authNeeded = false;
                 nodes.boxAuth.style.display = 'none';
                 render();
-                const dataLog = `✓ 数据已更新: Lv.${state.level} ${state.points}pts | 今日 +${state.todayEarned} | PC ${pc}/${pcM} 移动 ${mob}/${mobM} 活动 ${state.promosDone}/${state.promosTotal}`;
+                const todayText = state.todayEarnedSource === 'unavailable' ? '今日 --' : `今日 +${state.todayEarned}`;
+                const dataLog = `✓ 数据已更新: Lv.${state.level} ${state.points}pts | ${todayText} | PC ${pc}/${pcM} 移动 ${mob}/${mobM} 活动 ${state.promosDone}/${state.promosTotal}`;
                 if (dataLog !== lastDataLogSignature) {
                     lastDataLogSignature = dataLog;
                     log(dataLog);
@@ -1059,7 +1062,7 @@
     function render() {
         nodes.level.textContent = `Lv.${state.level}`;
         nodes.points.textContent = state.points.toLocaleString();
-        if (nodes.today) nodes.today.textContent = `+${state.todayEarned}`;
+        if (nodes.today) nodes.today.textContent = state.todayEarnedSource === 'unavailable' ? '--' : `+${state.todayEarned}`;
 
         if (state.pcSearchOk === false) {
             nodes.pc.textContent = '无搜索额度';
