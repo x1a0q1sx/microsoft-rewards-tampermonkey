@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.49
+// @version      1.0.1.50
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.49';
+        const SCRIPT_VERSION = '1.0.1.50';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -121,6 +121,7 @@
     let autoCloseMarkerId = '';
     let autoCloseTabMode = false;
     let autoCloseMarkerKind = '';
+    let autoCloseMarkerOpenedInNewTab = false;
     let lastDataLogSignature = '';
     let lastDashboardSource = '';
     let lastQuotaLogSignature = '';
@@ -1712,11 +1713,8 @@
         GM_setValue(AUTO_CLOSE_TAB_KEY, JSON.stringify((list || []).slice(-12)));
     }
 
-    function registerAutoCloseActivityTab(card, href, title, kind = 'subtask') {
-        if (!card || !href) return null;
-        const target = String(card.getAttribute('target') || '').toLowerCase();
-        // 只登记站点明确要求在新标签页打开的卡片，避免误关用户当前标签页。
-        if (!['_blank', '_new', 'blank'].includes(target)) return null;
+    function registerAutoCloseActivityTab(card, href, title, kind = 'subtask', openedInNewTab = true) {
+        if (!card || !href || !openedInNewTab) return null;
         let url;
         try { url = new URL(href, location.href).href; } catch (e) { return null; }
         const marker = {
@@ -1725,6 +1723,7 @@
             title: String(title || '').slice(0, 80),
             kind,
             source: location.href,
+            openedInNewTab,
             createdAt: Date.now()
         };
         const list = readAutoCloseTabs().filter(item => item.url !== url);
@@ -1780,10 +1779,19 @@
         const anchor = card.matches?.('a[href]') ? card : card.querySelector?.('a[href]');
         if (!anchor) return null;
         const originalHref = anchor.getAttribute('href') || '';
-        const target = String(anchor.getAttribute('target') || '').toLowerCase();
-        if (!originalHref || !['_blank', '_new', 'blank'].includes(target)) return null;
+        const originalTarget = String(anchor.getAttribute('target') || '').toLowerCase();
+        const originalOpenedInNewTab = ['_blank', '_new', 'blank'].includes(originalTarget);
+        if (!originalHref) return null;
 
-        const marker = registerAutoCloseActivityTab(anchor, originalHref, title, kind);
+        // 当前页跳转会把活动页误当成 Rewards 主页面，触发恢复并立即跳回。
+        // 点击前先强制新标签打开；若站点逻辑仍改当前页，活动页会等待后再返回。
+        let forcedNewTab = originalOpenedInNewTab;
+        if (!forcedNewTab) {
+            anchor.setAttribute('target', '_blank');
+            forcedNewTab = true;
+        }
+
+        const marker = registerAutoCloseActivityTab(anchor, originalHref, title, kind, forcedNewTab);
         if (!marker) return null;
         // 同时给新标签页加一个 fragment 标记。fragment 不会发送到服务器，
         // 不改变 rnoreward/query；比 window.name 更能跨 www/rewards 域名识别。
@@ -1798,14 +1806,16 @@
         } catch (e) {}
         // 保留原 target，避免改变 Rewards 自己的打开方式；URL fragment
         // 和 GM 状态已经足够识别这次脚本触发的新标签页。
-        return { marker, anchor, originalHref, originalTarget: target };
+        return { marker, anchor, originalHref, originalTarget: originalTarget };
     }
 
     function restoreTrackedActivityTab(prepared) {
         if (!prepared?.anchor || !prepared.originalHref) return;
-        // 新标签页已经在 click 的默认行为中同步创建。立即恢复页面原链接，
-        // 避免下一轮把“带标记的绝对 URL”误认成另一张活动卡。
+        // 新标签页已在 click 默认行为中同步创建。恢复原 href/target，
+        // 避免 React 下一轮把“带标记的绝对 URL”误认成另一张活动卡。
         prepared.anchor.setAttribute('href', prepared.originalHref);
+        if (prepared.originalTarget) prepared.anchor.setAttribute('target', prepared.originalTarget);
+        else prepared.anchor.removeAttribute('target');
     }
 
     function findCurrentAutoCloseMarker() {
@@ -1819,17 +1829,18 @@
     function markCurrentAutoCloseActivityTab() {
         const marker = findCurrentAutoCloseMarker();
         if (!marker) return false;
-        autoCloseTabMode = true;
         autoCloseMarkerId = marker.id;
         autoCloseMarkerKind = marker.kind || 'subtask';
-        autoCloseAfterPromo = true;
+        autoCloseMarkerOpenedInNewTab = marker.openedInNewTab !== false;
+        autoCloseTabMode = autoCloseMarkerOpenedInNewTab;
+        autoCloseAfterPromo = autoCloseMarkerOpenedInNewTab;
         try {
             const clean = new URL(location.href);
             clean.searchParams.delete('mr_auto_close');
             if (clean.hash.includes('mr_auto_close=')) clean.hash = '';
             history.replaceState(null, '', clean.href);
         } catch (e) {}
-        log('🧹 活动标签页已接管，完成签到后自动关闭');
+        log(autoCloseMarkerOpenedInNewTab ? '🧹 活动标签页已接管，完成签到后自动关闭' : '🧹 活动页已在当前标签打开，先等待计分，再返回 Rewards');
         return true;
     }
 
@@ -1837,6 +1848,7 @@
         const marker = readAutoCloseTabs().find(item => item.id === autoCloseMarkerId) ||
             findCurrentAutoCloseMarker();
         if (!marker) return false;
+        if (!autoCloseMarkerOpenedInNewTab && marker.openedInNewTab === false) return false;
         const left = readAutoCloseTabs().filter(item => item.id !== marker.id);
         writeAutoCloseTabs(left);
         autoCloseTabMode = false;
@@ -3066,7 +3078,12 @@
             // 新开的活动标签页只负责让目标页面完成计分并等待主页面关闭。
             // 若它也恢复 runPromo，会与主页面并发点击，出现 1、2、2 而漏掉第 3 张卡。
             if (pending && hasPromoResumeIntent()) {
-                if (isTrackedActivityTab) {
+                if (isTrackedActivityTab && !autoCloseMarkerOpenedInNewTab) {
+                    log('⏳ 活动页已打开，先等待 12 秒计分，再返回 Rewards...');
+                    await sleep(12000);
+                    location.replace(getRewardsResumeUrl(autoCloseMarkerId));
+                    return;
+                } else if (isTrackedActivityTab) {
                     log('🧹 活动页面已加载，等待主页面完成剩余任务');
                 } else if (isRewardsPage()) {
                     log('↩️ 继续执行刚才主动开始的活动...');
@@ -3074,7 +3091,7 @@
                     await runPromo(false);
                 } else if (/(^|\.)bing\.com$/i.test(location.hostname)) {
                     log('↩️ 继续前往 Rewards 页面完成刚才主动开始的活动...');
-                    location.href = getRewardsResumeUrl(isTrackedActivityTab ? autoCloseMarkerId : '');
+                    location.href = getRewardsResumeUrl('');
                 }
             } else if (pending) {
                 log('ℹ️ 有未完成活动待办；请点击“活动”或“一键全部执行”后继续。');
