@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.52
+// @version      1.0.1.53
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.52';
+        const SCRIPT_VERSION = '1.0.1.53';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -78,6 +78,7 @@
         readCur: 0, readMax: 0,
         pcSearchOk: true, mobSearchOk: true, // 账户是否具备 PC/移动 搜索额度（区域限制自动检测）
         todayEarned: 0, todayEarnedSource: '',
+        taskTabCompleted: 0,
         running: false,
         accessToken: null,
         accessTokenExpiresAt: 0,
@@ -102,6 +103,10 @@
     const PENDING_PROMO_KEY = 'mr_pending_promo';
     const PROMO_RESUME_KEY = 'mr_promo_resume_intent';
     const DAILY_STREAK_STATE_KEY = 'mr_daily_streak_state';
+    const TASK_TABS_KEY = 'mr_task_tabs';
+    const TASK_TAB_STATES_KEY = 'mr_task_tab_states';
+    const TASK_TAB_TIMEOUT = 60 * 1000;
+    const TASK_TAB_TTL = 10 * 60 * 1000;
     const DAILY_POINTS_KEY = 'mr_daily_points';
     const AUTO_CLOSE_TAB_KEY = 'mr_auto_close_activity_tabs';
     const AUTO_CLOSE_TAB_PREFIX = '__MR_AUTO_CLOSE_ACTIVITY__:';
@@ -1710,6 +1715,161 @@
         GM_setValue(AUTO_CLOSE_TAB_KEY, JSON.stringify((list || []).slice(-12)));
     }
 
+    function readTaskTabs() {
+        try {
+            const raw = GM_getValue(TASK_TABS_KEY, '');
+            const list = raw ? JSON.parse(raw) : [];
+            return Array.isArray(list) ? list : [];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function writeTaskTabs(list) {
+        GM_setValue(TASK_TABS_KEY, JSON.stringify((list || []).slice(-12)));
+    }
+
+    function addTaskTab(id, url) {
+        let abs = url;
+        try { abs = new URL(url, location.href).href; } catch (_) {}
+        const list = readTaskTabs().filter(item => item.id !== id && item.url !== abs);
+        list.push({ id, url: abs, ts: Date.now() });
+        writeTaskTabs(list);
+        return abs;
+    }
+
+    function matchTaskTab(entry) {
+        try {
+            const expected = new URL(entry.url);
+            const current = new URL(location.href);
+            const rootHost = host => String(host || '').toLowerCase().replace(/^(www|cn)\./, '');
+            if (rootHost(expected.hostname) !== rootHost(current.hostname)) return false;
+            if (expected.pathname.replace(/\/$/, '') !== current.pathname.replace(/\/$/, '')) return false;
+            if (expected.pathname.toLowerCase() === '/search') {
+                return !!expected.searchParams.get('q') &&
+                    expected.searchParams.get('q') === current.searchParams.get('q');
+            }
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function readTaskTabStates() {
+        try {
+            const raw = GM_getValue(TASK_TAB_STATES_KEY, '');
+            const data = raw ? JSON.parse(raw) : {};
+            const now = Date.now();
+            Object.keys(data).forEach(id => {
+                if (!data[id] || now - Number(data[id].at || 0) > TASK_TAB_TTL) delete data[id];
+            });
+            return data;
+        } catch (_) {
+            return {};
+        }
+    }
+
+    function markTaskTabDone(id) {
+        const data = readTaskTabStates();
+        data[id] = { done: true, at: Date.now() };
+        GM_setValue(TASK_TAB_STATES_KEY, JSON.stringify(data));
+    }
+
+    async function waitTaskTabDone(id, timeout = TASK_TAB_TIMEOUT) {
+        const end = Date.now() + timeout;
+        while (Date.now() < end) {
+            if (readTaskTabStates()[id]?.done) return true;
+            await sleep(500);
+        }
+        return false;
+    }
+
+    function stripNoopener(el) {
+        const anchor = el?.matches?.('a[href]') ? el : el?.querySelector?.('a[href]');
+        if (!anchor) return null;
+        const rel = anchor.getAttribute('rel') || '';
+        if (!/noopener/i.test(rel)) return null;
+        anchor.setAttribute('rel', rel.replace(/noopener/ig, '').replace(/\s+/g, ' ').trim() || 'noreferrer');
+        return { anchor, rel };
+    }
+
+    function restoreNoopener(saved) {
+        if (!saved?.anchor) return;
+        try { saved.anchor.setAttribute('rel', saved.rel); } catch (_) {}
+    }
+
+    async function humanClickElement(el) {
+        if (!el) return false;
+        try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+        await sleep(randomRange(260, 620));
+        const doc = el.ownerDocument || document;
+        const pageWindow = doc.defaultView || window;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 2 || rect.height < 2) return false;
+
+        const clientX = Math.round(rect.left + rect.width * (0.4 + Math.random() * 0.2));
+        const clientY = Math.round(rect.top + rect.height * (0.4 + Math.random() * 0.2));
+        let target = el;
+        try {
+            const hit = doc.elementFromPoint(clientX, clientY);
+            if (hit && el.contains(hit)) target = hit;
+        } catch (_) {}
+
+        const isAnchor = target.tagName === 'A' && target.hasAttribute?.('href');
+        if (isAnchor) {
+            try { target.click(); } catch (_) {}
+            return true;
+        }
+
+        const base = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            button: 0,
+            buttons: 1,
+            clientX,
+            clientY
+        };
+        const fire = (name, extra = {}) => {
+            const Ctor = /^pointer/.test(name)
+                ? (pageWindow.PointerEvent || window.PointerEvent)
+                : (pageWindow.MouseEvent || window.MouseEvent);
+            if (typeof Ctor !== 'function') return;
+            const init = { ...base, ...extra };
+            if (/^pointer/.test(name)) {
+                init.pointerType = 'mouse';
+                init.isPrimary = true;
+                init.pointerId = 1;
+            }
+            try { target.dispatchEvent(new Ctor(name, init)); } catch (_) {}
+        };
+
+        let opened = false;
+        const originalOpen = window.open;
+        try {
+            window.open = function (...args) {
+                opened = true;
+                return originalOpen.apply(window, args);
+            };
+        } catch (_) {}
+
+        fire('pointerover');
+        fire('mouseover', { buttons: 0 });
+        await sleep(randomRange(40, 110));
+        fire('pointerdown');
+        fire('mousedown');
+        await sleep(randomRange(60, 150));
+        fire('pointerup', { buttons: 0 });
+        fire('mouseup', { buttons: 0 });
+        await sleep(700);
+
+        try { window.open = originalOpen; } catch (_) {}
+        if (!opened) {
+            try { target.click(); } catch (_) {}
+        }
+        return true;
+    }
+
     function registerAutoCloseActivityTab(card, href, title, kind = 'subtask', openedInNewTab = true) {
         if (!card || !href || !openedInNewTab) return null;
         let url;
@@ -2123,7 +2283,7 @@
         try {
             trigger.scrollIntoView({ block: 'center', inline: 'center' });
             await sleep(300);
-            clickRewardsCardWithoutNavigation(trigger);
+            await humanClickElement(trigger);
             log('📂 已打开“每日连续打卡活动”侧边栏，等待子活动卡片...');
         } catch (e) {
             log('❌ 打开“每日连续打卡活动”失败: ' + e.message);
@@ -2380,8 +2540,8 @@
             try {
                 card.scrollIntoView({ block: 'center', inline: 'center' });
                 await sleep(250);
-                // 触发卡片点击计分，但阻止 <a> 默认跳转，避免页面来回跳。
-                clickRewardsCardWithoutNavigation(card);
+                // 每日连续打卡子卡在侧边栏内，按真实点击处理，不强制跳转。
+                await humanClickElement(card);
                 await sleep(700);
                 const result = await waitForDailyStreakCardResult(panel, key, beforeProgress, 6000);
                 panel = result.panel;
@@ -2528,8 +2688,20 @@
         try {
             card.scrollIntoView({ block: 'center', inline: 'center' });
             await sleep(300);
-            clickRewardsCardWithoutNavigation(card);
-            // 点击后等待上报（rewards 通常 4-5s 才回写进度）
+            const anchor = card.matches?.('a[href]') ? card : card.querySelector?.('a[href]');
+            const href = anchor?.getAttribute?.('href') || item.destinationUrl || '';
+            const taskId = uuid();
+            if (href) addTaskTab(taskId, href);
+            const savedRel = stripNoopener(card);
+            await humanClickElement(card);
+            setTimeout(() => restoreNoopener(savedRel), 5000);
+            if (href) {
+                const done = await waitTaskTabDone(taskId, TASK_TAB_TIMEOUT);
+                log(done
+                    ? `  ✅ 任务页已完成并关闭：${title || item.offerId}`
+                    : `  ⚠️ 未收到任务页完成回报：${title || item.offerId}`);
+                return done;
+            }
             await sleep(5000);
             return true;
         } catch (e) {
@@ -3060,9 +3232,44 @@
         } catch (e) { /* ignore */ }
     })();
 
+    function showTaskTabOverlay(text) {
+        try {
+            let box = document.getElementById('mr-task-tab-overlay');
+            if (!box) {
+                box = document.createElement('div');
+                box.id = 'mr-task-tab-overlay';
+                box.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:2147483647;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.15);padding:12px 14px;font:13px/1.5 sans-serif;color:#333';
+                (document.body || document.documentElement).appendChild(box);
+            }
+            box.textContent = text;
+        } catch (_) {}
+    }
+
+    function handleRewardsTaskTab() {
+        const pending = readTaskTabs();
+        if (!pending.length) return false;
+        const hit = pending.find(matchTaskTab);
+        if (!hit) return false;
+
+        // 立即消费，避免 www→cn 重定向第二次命中。
+        writeTaskTabs(pending.filter(item => item.id !== hit.id));
+        const stay = randomRange(4, 8);
+        showTaskTabOverlay(`🎁 Rewards 任务页已记录，${stay} 秒后自动关闭`);
+        setTimeout(() => {
+            markTaskTabDone(hit.id);
+            showTaskTabOverlay('🎁 Rewards 任务页已完成，正在关闭…');
+            try { window.close(); } catch (_) {}
+            setTimeout(() => {
+                if (!window.closed) showTaskTabOverlay('任务页已完成；浏览器阻止自动关闭，请手动关闭本标签');
+            }, 700);
+        }, stay * 1000);
+        return true;
+    }
+
     // Init
     (async () => {
         try {
+            if (handleRewardsTaskTab()) return;
             const isTrackedActivityTab = markCurrentAutoCloseActivityTab();
             startAutoCloseActivityTabMonitor();
             loginCookie = await getCookies('https://login.live.com');
