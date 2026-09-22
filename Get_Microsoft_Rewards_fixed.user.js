@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.51
+// @version      1.0.1.52
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.51';
+        const SCRIPT_VERSION = '1.0.1.52';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
         window.__MR_VERSION__ = SCRIPT_VERSION;
@@ -2074,6 +2074,25 @@
         return true;
     }
 
+    // 很多 Rewards 卡片同时是 <a> 链接。只触发 click 会让浏览器跳到活动页；
+    // React 的计分 handler 仍需要 click 冒泡，所以只 preventDefault，不 stopPropagation。
+    function clickRewardsCardWithoutNavigation(card) {
+        if (!card) return false;
+        const anchor = card.closest?.('a[href]') || (card.querySelector?.('a[href]')) || card;
+        const stopNavigation = e => {
+            if (!isAssistantUiElement(card)) e.preventDefault();
+        };
+        try {
+            anchor.addEventListener('click', stopNavigation, false);
+            dispatchRewardsCardClick(card);
+        } finally {
+            setTimeout(() => {
+                try { anchor.removeEventListener('click', stopNavigation, false); } catch (_) {}
+            }, 1000);
+        }
+        return true;
+    }
+
     function findDailyStreakEntry() {
         const candidates = getVisibleElements('a, button, [role=link], [role=button], [tabindex]')
             .map(getInteractiveElement)
@@ -2104,11 +2123,7 @@
         try {
             trigger.scrollIntoView({ block: 'center', inline: 'center' });
             await sleep(300);
-            // 入口本身有时会以新标签页打开“每日连续打卡”页面，
-            // 随后当前 Rewards 页再出现“每日连续打卡活动”侧边栏。
-            // 入口也要登记，否则完成后只会关掉子活动页，留下第一层页面。
-            prepareTrackedActivityTab(trigger, '每日连续打卡活动', 'panel');
-            trigger.click();
+            clickRewardsCardWithoutNavigation(trigger);
             log('📂 已打开“每日连续打卡活动”侧边栏，等待子活动卡片...');
         } catch (e) {
             log('❌ 打开“每日连续打卡活动”失败: ' + e.message);
@@ -2365,16 +2380,8 @@
             try {
                 card.scrollIntoView({ block: 'center', inline: 'center' });
                 await sleep(250);
-                // 子卡可能导航到活动页；保存用户主动触发的恢复意图，
-                // 这样新页面加载后会回到 earn 并继续剩余卡片。
-                setPromoResumeIntent();
-                const trackedTab = prepareTrackedActivityTab(card, text);
-                // 触发完整的鼠标事件链，兼容 React/React-Aria 只监听 pointer/click 的卡片。
-                try {
-                    dispatchRewardsCardClick(card);
-                } finally {
-                    restoreTrackedActivityTab(trackedTab);
-                }
+                // 触发卡片点击计分，但阻止 <a> 默认跳转，避免页面来回跳。
+                clickRewardsCardWithoutNavigation(card);
                 await sleep(700);
                 const result = await waitForDailyStreakCardResult(panel, key, beforeProgress, 6000);
                 panel = result.panel;
@@ -2521,8 +2528,7 @@
         try {
             card.scrollIntoView({ block: 'center', inline: 'center' });
             await sleep(300);
-            card.click();
-            log('  ✅ 已 click 卡片元素（tag=' + card.tagName + '）');
+            clickRewardsCardWithoutNavigation(card);
             // 点击后等待上报（rewards 通常 4-5s 才回写进度）
             await sleep(5000);
             return true;
@@ -2531,6 +2537,20 @@
             return false;
         }
     };
+
+    async function refreshPointsAfterRun(seconds = 20) {
+        const deadline = Date.now() + seconds * 1000;
+        let lastPoints = state.points, lastLevel = state.level, lastToday = state.todayEarned;
+        while (Date.now() < deadline) {
+            await sleep(5000);
+            await updateData();
+            if (state.points !== lastPoints || state.level !== lastLevel || state.todayEarned !== lastToday) {
+                log(`✓ 积分已刷新: ${state.points} pts`);
+                return;
+            }
+        }
+        log(`ℹ️ 积分暂未刷新，当前 ${state.points} pts`);
+    }
 
     const runPromo = async (userInitiated = false) => {
         if (userInitiated) setPromoResumeIntent();
@@ -3005,6 +3025,7 @@
             await runSign();
             await runRead();
             await runSearch();
+            await refreshPointsAfterRun(25);
         } finally {
             state.allRunning = false;
             updateAllButton();
