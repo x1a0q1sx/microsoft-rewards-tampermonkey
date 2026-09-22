@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.53
+// @version      1.0.1.54
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
-// @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
-// @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
+// @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.54
+// @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.54
 // @author       QingJ
 // @icon         https://rewards.bing.com/rewardscdn/images/rewards.png
 // @match        https://www.bing.com/*
@@ -37,9 +37,9 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.53';
+        const SCRIPT_VERSION = '1.0.1.54';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
-        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js';
+        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.54';
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log('%c🔔 Microsoft Rewards 助手 v' + SCRIPT_VERSION + ' 已就绪',
             'color:#fff;background:#0078d4;padding:2px 8px;border-radius:4px;font-weight:bold');
@@ -831,6 +831,27 @@
         throw lastError || new Error('Bing Flyout 请求失败');
     }
 
+    function readDomAccountSnapshot() {
+        const snapshot = { points: 0, level: 0 };
+        try {
+            const nodes = [...document.querySelectorAll(
+                'button[aria-label*="profile" i],button[aria-label*="个人资料"],[role="button"],[aria-label*="Rewards" i]'
+            )];
+            const texts = nodes.map(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim());
+            texts.push((document.body?.innerText || '').slice(0, 4000));
+            for (const text of texts) {
+                const pointMatch = text.match(/([\d,]{3,})\s*pts/i) || text.match(/积分[：:\s]*([\d,]{3,})/i);
+                if (pointMatch) {
+                    const value = Number(pointMatch[1].replace(/,/g, ''));
+                    if (value > snapshot.points) snapshot.points = value;
+                }
+                const levelMatch = text.match(/Lv\.?\s*(\d+)/i);
+                if (levelMatch) snapshot.level = Math.max(snapshot.level, Number(levelMatch[1]) || 0);
+            }
+        } catch (_) {}
+        return snapshot;
+    }
+
     // 归一化 promotion 列表，兼容两种返回结构
     function normalizePromotions(dash, data) {
         const d = new Date();
@@ -1022,6 +1043,11 @@
                     || '';
                 const lvNum = parseInt(String(rawLevel).replace(/\D/g, ''));
                 if (lvNum) state.level = lvNum;
+
+                // API 偶发延迟/返回游客数据时，用页面当前显示值兜底。
+                const domSnapshot = readDomAccountSnapshot();
+                if (domSnapshot.points > 0) state.points = domSnapshot.points;
+                if (domSnapshot.level > 0) state.level = domSnapshot.level;
 
                 // 搜索计数器：两种 schema 的 counters 都是 {pcSearch:[],mobileSearch:[]}
                 const c = user.counters || resp.counters || {};
