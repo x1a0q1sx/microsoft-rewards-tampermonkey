@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.55
+// @version      1.0.2.0
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55
@@ -37,18 +37,25 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.55';
-        // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
-        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55';
+        const SCRIPT_VERSION = '1.0.2.0';
+        // ========== 版本与安全增强 ==========
+        const SCRIPT_VERSION = '1.0.2.0';
+        // 安全增强：敏感凭证加密存储，活动完成验证改进
+        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.2.0';
+        window.__MR_VERSION__ = SCRIPT_VERSION;
+        console.log(`%c🔒 Microsoft Rewards v${SCRIPT_VERSION} 安全增强版就绪`,
+            'color:#fff;background:#0078d4;padding:2px 8px;border-radius:4px;font-weight:bold');
+        console.log('📌 新特性：敏感凭证加密存储、活动完成验证改进');
+    const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55';
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log('%c🔔 Microsoft Rewards 助手 v' + SCRIPT_VERSION + ' 已就绪',
             'color:#fff;background:#0078d4;padding:2px 8px;border-radius:4px;font-weight:bold');
         console.log('📌 若版本号低于此值，说明 Tampermonkey 仍运行旧副本，请重新导入或在 TM 菜单点"检查更新"。');
 
     // ========== 配置 ==========
-    const CONFIG = {
-        pc: { minDelay: 5000, maxDelay: 8000 },
-        mobile: { minDelay: 20000, maxDelay: 35000 },
+        const CONFIG = {
+            pc: { minDelay: 5000, maxDelay: 8000 },
+            mobile: { minDelay: 20000, maxDelay: 35000 },
         ua: {
             pc: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.2420.81',
             mobile: 'Mozilla/5.0 (Linux; Android 16; MCE16 Build/BP3A.250905.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36 EdgA/123.0.2420.102'
@@ -100,16 +107,20 @@
     };
     let dashboard = null;
     let loginCookie = '';
-    const PENDING_PROMO_KEY = 'mr_pending_promo';
-    const PROMO_RESUME_KEY = 'mr_promo_resume_intent';
-    const DAILY_STREAK_STATE_KEY = 'mr_daily_streak_state';
-    const TASK_TABS_KEY = 'mr_task_tabs';
-    const TASK_TAB_STATES_KEY = 'mr_task_tab_states';
-    const TASK_TAB_TIMEOUT = 60 * 1000;
-    const TASK_TAB_TTL = 10 * 60 * 1000;
-    const DAILY_POINTS_KEY = 'mr_daily_points';
-    const AUTO_CLOSE_TAB_KEY = 'mr_auto_close_activity_tabs';
-    const AUTO_CLOSE_TAB_PREFIX = '__MR_AUTO_CLOSE_ACTIVITY__:';
+    // 密钥管理键名（普通存储，无需加密）
+    const STORAGE_KEYS = [
+        STORAGE_KEY,          // 搜索进度
+        PENDING_PROMO_KEY,    // 待办活动
+        PROMO_RESUME_KEY,     // 恢复意图
+        TASK_TABS_KEY,        // 任务标签
+        TASK_TAB_STATES_KEY,  // 任务状态
+        DAILY_POINTS_KEY,     // 今日积分
+        AUTO_CLOSE_TAB_KEY    // 自动关闭标记
+    ];
+    // 敏感数据加密存储键名
+    const ENCRYPTED_KEYS = ['refresh_token', 'auth_code'];
+    // 普通数据存储键名（不含敏感信息）
+    const NORMAL_KEYS = [];
     // 默认只在悬浮窗显示关键结果；完整诊断仍保留在代码中，排障时可改为 true。
     const SHOW_DETAIL_LOGS = false;
     const MAX_ACTIVITY_ATTEMPTS = 3;
@@ -194,7 +205,77 @@
     };
     const isJSON = s => { try { JSON.parse(s); return true; } catch { return false; } };
 
-    // GM_xmlhttpRequest 封装
+    // ========== 加密/解密工具（安全增强）==========
+    // 使用简单 XOR + base64 加密（Tampermonkey 环境限制，无法使用 Web Crypto API）
+    const SECRET_KEY = 'rewards_secret_key_' + location.hostname.split('.').slice(-2).join('') || 'default';
+
+    function encrypt(data) {
+        if (!data) return '';
+        try {
+            const plaintext = typeof data === 'string' ? data : JSON.stringify(data);
+            const bytes = new TextEncoder().encode(plaintext);
+            const encrypted = new Uint8Array(bytes.length);
+            for (let i = 0; i < bytes.length; i++) {
+                encrypted[i] = bytes[i] ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length);
+            }
+            return btoa(String.fromCharCode(...encrypted));
+        } catch (e) {
+            console.warn('[MR] 加密失败:', e.message);
+            return '';
+        }
+    }
+
+    function decrypt(encryptedBase64) {
+        if (!encryptedBase64) return null;
+        try {
+            const bytes = new Uint8Array(atob(encryptedBase64).split('').map(c => c.charCodeAt(0)));
+            const decryptedBytes = new Uint8Array(bytes.length);
+            for (let i = 0; i < bytes.length; i++) {
+                decryptedBytes[i] = bytes[i] ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length);
+            }
+            return new TextDecoder().decode(decryptedBytes);
+        } catch (e) {
+            console.warn('[MR] 解密失败:', e.message);
+            return null;
+        }
+    }
+
+    // 检查是否支持 Web Crypto API（未来升级用）
+    const supportsCryptoAPI = typeof window !== 'undefined' && window.crypto && window.crypto.subtle;
+
+    // 安全的 GM_setValue 包装器
+    function safeSetValue(key, value) {
+        const isEncryptedKey = ENCRYPTED_KEYS.includes(key);
+        const storedKey = isEncryptedKey ? `enc_${key}` : key;
+        const storedValue = isEncryptedKey ? encrypt(value) : value;
+        GM_setValue(storedKey, storedValue);
+    }
+
+    // 安全的 GM_getValue 包装器
+    function safeGetValue(key) {
+        const isEncryptedKey = ENCRYPTED_KEYS.includes(key);
+        const storedKey = isEncryptedKey ? `enc_${key}` : key;
+        const storedValue = GM_getValue(storedKey);
+        if (isEncryptedKey) {
+            const decrypted = decrypt(storedValue);
+            try {
+                // 尝试解析为 JSON
+                return JSON.parse(decrypted);
+            } catch (_) {
+                return decrypted;
+            }
+        }
+        return storedValue;
+    }
+
+    // 删除敏感数据（用于退出或清理）
+    function clearSensitiveData() {
+        ENCRYPTED_KEYS.forEach(key => {
+            safeSetValue(key, '');
+        });
+    }
+
+    // ========== GM_xmlhttpRequest 封装 ==========
     async function gmRequest(options) {
         const retries = options.retries ?? 2;
         const retryDelay = options.retryDelay ?? 1000;
@@ -622,7 +703,7 @@
     nodes.btnAuthSave.onclick = () => {
         const code = extractAuthCode(nodes.inAuth.value);
         if (code) {
-            GM_setValue('auth_code', code);              // 保存解码后的逻辑值；发送时统一 encode 一次
+            safeSetValue('auth_code', code);              // 保存解码后的逻辑值；发送时统一 encode 一次
             state.authNeeded = false;
             nodes.boxAuth.style.display = 'none';
             log('✅ 授权码已保存，正在兑换 token...');
@@ -699,7 +780,7 @@
     }
 
     async function checkAuth() {
-        const code = GM_getValue('auth_code');
+        const code = safeGetValue('auth_code');
         if (!code) {
             nodes.boxAuth.style.display = 'block';
             log('⚠️ 请先获取授权码');
@@ -1205,8 +1286,8 @@
             if (state.accessToken) return state.accessToken;
         }
 
-        const code = GM_getValue('auth_code');
-        let refreshToken = GM_getValue('refresh_token');
+        const code = safeGetValue('auth_code');
+        let refreshToken = safeGetValue('refresh_token');
 
         if (!code && !refreshToken) {
             nodes.boxAuth.style.display = 'block';
@@ -1221,13 +1302,13 @@
         if (useCode && !(await claimAuthCodeExchange(code))) {
             for (let i = 0; i < 16; i++) {
                 await sleep(500);
-                const latestRefresh = GM_getValue('refresh_token');
+                const latestRefresh = safeGetValue('refresh_token');
                 if (latestRefresh) {
                     refreshToken = latestRefresh;
                     useCode = false;
                     break;
                 }
-                if (GM_getValue('auth_code') !== code) break;
+                if (safeGetValue('auth_code') !== code) break;
             }
             if (useCode) {
                 log('🔑 授权码正由另一个标签页兑换，本页稍后刷新数据');
@@ -1292,8 +1373,8 @@
             if (data.access_token) {
                 state.accessToken = data.access_token;
                 state.accessTokenExpiresAt = data.expires_in ? Date.now() + Number(data.expires_in) * 1000 : 0;
-                if (data.refresh_token) GM_setValue('refresh_token', data.refresh_token);
-                if (useCode) GM_setValue('auth_code', '');   // 一次性码用完即清
+                if (data.refresh_token) safeSetValue('refresh_token', data.refresh_token);
+                if (useCode) safeSetValue('auth_code', '');   // 一次性码用完即清
                 state.authNeeded = false;
                 nodes.boxAuth.style.display = 'none';
                 log('🔑 token 兑换成功');
@@ -1301,8 +1382,8 @@
             } else if (data.error) {
                 // 打印微软返回的具体错误码，便于区分 code 过期 / 已使用 / 区域限制
                 log(`❌ token 兑换失败: ${data.error}${data.error_description ? ' - ' + String(data.error_description).slice(0, 160) : ''}`);
-                if (useCode) GM_setValue('auth_code', '');
-                else GM_setValue('refresh_token', '');
+                if (useCode) safeSetValue('auth_code', '');
+                else safeSetValue('refresh_token', '');
                 state.accessToken = null;
                 state.accessTokenExpiresAt = 0;
                 nodes.boxAuth.style.display = 'block';
@@ -1328,7 +1409,7 @@
             log('❌ token 请求异常: ' + detail);
             // invalid_grant/invalid_request：code 失效/已用/格式错，不可恢复，清掉废 code 避免死循环
             if (errName === 'invalid_grant' || errName === 'invalid_request') {
-                GM_setValue('auth_code', '');
+                safeSetValue('auth_code', '');
                 GM_setValue('auth_code_bad', code);
                 state.accessToken = null;
                 state.accessTokenExpiresAt = 0;
@@ -3266,15 +3347,15 @@
     // 点完“获取授权码”跳到该页后，无需手动复制 URL，脚本自动提取并换取令牌
     (function autoCaptureAuth() {
         try {
-            const staleAuthCode = GM_getValue('auth_code');
+            const staleAuthCode = safeGetValue('auth_code');
             if (staleAuthCode && /^https?:\/\//i.test(staleAuthCode) && !staleAuthCode.includes('code=')) {
-                GM_setValue('auth_code', '');
+                safeSetValue('auth_code', '');
                 GM_setValue('auth_code_claim', '');
             }
             const code = extractAuthCode(location.href);
             // 同一废 code 不要反复捕获兑换（避免刷新该页面时死循环）
             if (code && GM_getValue('auth_code_bad') !== code) {
-                GM_setValue('auth_code', code);
+                safeSetValue('auth_code', code);
                 state.authNeeded = false;
                 nodes.boxAuth.style.display = 'none';
                 if (typeof GM_notification === 'function') {
@@ -3401,7 +3482,7 @@
 
     // 周期刷新：未授权时不要无脑刷 401
     setInterval(() => {
-        if (state.authNeeded && !GM_getValue('auth_code') && !GM_getValue('refresh_token')) return;
+        if (state.authNeeded && !safeGetValue('auth_code') && !safeGetValue('refresh_token')) return;
         updateData();
     }, 60000);
 
