@@ -1917,6 +1917,13 @@
 
         const isAnchor = target.tagName === 'A' && target.hasAttribute?.('href');
         if (isAnchor) {
+            // 没有 target=_blank 的卡片直接 click() 会把当前 Rewards 页整个跳走，
+            // 正在跑的这轮活动随之被销毁（表现为来回跳页、活动一个都做不完）。
+            // 这里强制改成新标签打开：目标页照样加载，主页面还能继续跑下一张卡。
+            const anchorTarget = String(target.getAttribute('target') || '').toLowerCase();
+            if (!['_blank', '_new'].includes(anchorTarget)) {
+                try { target.setAttribute('target', '_blank'); } catch (_) {}
+            }
             try { target.click(); } catch (_) {}
             return true;
         }
