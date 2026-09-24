@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.3.0
+// @version      1.0.3.1
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55
@@ -37,20 +37,12 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.3.0';
-        // ========== 版本与安全增强 ==========
-        const SCRIPT_VERSION = '1.0.2.0';
-        // 安全增强：敏感凭证加密存储，活动完成验证改进
-        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.2.0';
+        const SCRIPT_VERSION = '1.0.3.1';
+        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.3.1';
         window.__MR_VERSION__ = SCRIPT_VERSION;
-        console.log(`%c🔒 Microsoft Rewards v${SCRIPT_VERSION} 安全增强版就绪`,
+        console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
             'color:#fff;background:#0078d4;padding:2px 8px;border-radius:4px;font-weight:bold');
-        console.log('📌 新特性：敏感凭证加密存储、活动完成验证改进');
-    const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55';
-        window.__MR_VERSION__ = SCRIPT_VERSION;
-        console.log('%c🔔 Microsoft Rewards 助手 v' + SCRIPT_VERSION + ' 已就绪',
-            'color:#fff;background:#0078d4;padding:2px 8px;border-radius:4px;font-weight:bold');
-        console.log('📌 若版本号低于此值，说明 Tampermonkey 仍运行旧副本，请重新导入或在 TM 菜单点"检查更新"。');
+        console.log('📌 若版本号低于此值，请重新导入或在 TM 菜单点"检查更新"。');
 
     // ========== 配置 ==========
         const CONFIG = {
@@ -240,9 +232,6 @@
         }
     }
 
-    // 检查是否支持 Web Crypto API（未来升级用）
-    const supportsCryptoAPI = typeof window !== 'undefined' && window.crypto && window.crypto.subtle;
-    
     // ===== URL 安全检查：防止恶意钓鱼页面跳转 =====
     function isSafeUrl(url) { if (!url || url.trim()==='') return false; try { const p=new URL(url); const h=p.hostname.toLowerCase(); return ['rewards.bing.com','www.bing.com','cn.bing.com','login.live.com'].some(d=>h===d||h.endsWith('.'+d)) } catch(_) { return false } }
 
@@ -2043,50 +2032,6 @@
         return url.href;
     }
 
-    function prepareTrackedActivityTab(card, title, kind = 'subtask') {
-        if (!card) return null;
-        const anchor = card.matches?.('a[href]') ? card : card.querySelector?.('a[href]');
-        if (!anchor) return null;
-        const originalHref = anchor.getAttribute('href') || '';
-        const originalTarget = String(anchor.getAttribute('target') || '').toLowerCase();
-        const originalOpenedInNewTab = ['_blank', '_new', 'blank'].includes(originalTarget);
-        if (!originalHref) return null;
-
-        // 当前页跳转会把活动页误当成 Rewards 主页面，触发恢复并立即跳回。
-        // 点击前先强制新标签打开；若站点逻辑仍改当前页，活动页会等待后再返回。
-        let forcedNewTab = originalOpenedInNewTab;
-        if (!forcedNewTab) {
-            anchor.setAttribute('target', '_blank');
-            forcedNewTab = true;
-        }
-
-        const marker = registerAutoCloseActivityTab(anchor, originalHref, title, kind, forcedNewTab);
-        if (!marker) return null;
-        // 同时给新标签页加一个 fragment 标记。fragment 不会发送到服务器，
-        // 不改变 rnoreward/query；比 window.name 更能跨 www/rewards 域名识别。
-        try {
-            const markedUrl = new URL(originalHref, location.href);
-            markedUrl.hash = `mr_auto_close=${encodeURIComponent(marker.id)}`;
-            anchor.setAttribute('href', markedUrl.href);
-            const list = readAutoCloseTabs().map(item => item.id === marker.id
-                ? { ...item, markedUrl: markedUrl.href }
-                : item);
-            writeAutoCloseTabs(list);
-        } catch (e) {}
-        // 保留原 target，避免改变 Rewards 自己的打开方式；URL fragment
-        // 和 GM 状态已经足够识别这次脚本触发的新标签页。
-        return { marker, anchor, originalHref, originalTarget: originalTarget };
-    }
-
-    function restoreTrackedActivityTab(prepared) {
-        if (!prepared?.anchor || !prepared.originalHref) return;
-        // 新标签页已在 click 默认行为中同步创建。恢复原 href/target，
-        // 避免 React 下一轮把“带标记的绝对 URL”误认成另一张活动卡。
-        prepared.anchor.setAttribute('href', prepared.originalHref);
-        if (prepared.originalTarget) prepared.anchor.setAttribute('target', prepared.originalTarget);
-        else prepared.anchor.removeAttribute('target');
-    }
-
     function findCurrentAutoCloseMarker() {
         const list = readAutoCloseTabs();
         return getAutoCloseMarkerFromCurrentUrl(list) || list.find(item =>
@@ -2299,70 +2244,6 @@
         return el.matches('a, button, [role=link], [role=button], [tabindex]')
             ? el
             : el.closest('a, button, [role=link], [role=button], [tabindex]');
-    }
-
-    // 油猴沙箱里的 window 不是页面自己的 Window。把它作为 UIEventInit.view
-    // 传给页面的 PointerEvent 构造器会触发：Failed to convert value to Window。
-    // 事件构造器改用卡片所属文档的原生构造器，并且不传 view；Rewards/React
-    // 只需要 bubbling 的 pointer/click 事件，不依赖 view 字段。
-    function dispatchRewardsCardClick(card) {
-        if (!card) return false;
-        const doc = card.ownerDocument || document;
-        const pageWindow = doc.defaultView || window;
-        const eventBase = {
-            bubbles: true,
-            cancelable: true,
-            composed: true,
-            button: 0,
-            buttons: 1
-        };
-        const PointerCtor = pageWindow.PointerEvent || window.PointerEvent;
-        const MouseCtor = pageWindow.MouseEvent || window.MouseEvent;
-
-        // Synthetic pointer events are only an optional compatibility layer. If a
-        // browser/Tampermonkey realm rejects one of their init dictionaries, the
-        // real element click must still happen.
-        try {
-            if (typeof PointerCtor === 'function') {
-                card.dispatchEvent(new PointerCtor('pointerdown', {
-                    ...eventBase, pointerType: 'mouse', isPrimary: true
-                }));
-            }
-        } catch (e) {}
-        try {
-            if (typeof MouseCtor === 'function') card.dispatchEvent(new MouseCtor('mousedown', eventBase));
-        } catch (e) {}
-        try {
-            if (typeof PointerCtor === 'function') {
-                card.dispatchEvent(new PointerCtor('pointerup', {
-                    ...eventBase, pointerType: 'mouse', isPrimary: true, buttons: 0
-                }));
-            }
-        } catch (e) {}
-        try {
-            if (typeof MouseCtor === 'function') card.dispatchEvent(new MouseCtor('mouseup', { ...eventBase, buttons: 0 }));
-        } catch (e) {}
-        card.click();
-        return true;
-    }
-
-    // 很多 Rewards 卡片同时是 <a> 链接。只触发 click 会让浏览器跳到活动页；
-    // React 的计分 handler 仍需要 click 冒泡，所以只 preventDefault，不 stopPropagation。
-    function clickRewardsCardWithoutNavigation(card) {
-        if (!card) return false;
-        const anchor = card.closest?.('a[href]') || (card.querySelector?.('a[href]')) || card;
-        const stopNavigation = e => {
-            if (!isAssistantUiElement(card)) e.preventDefault();
-        };
-        try {
-            anchor.addEventListener('click', stopNavigation, false);
-            dispatchRewardsCardClick(card);
-        } finally {
-            setTimeout(() => {
-                try { anchor.removeEventListener('click', stopNavigation, false); } catch (_) {}
-            }, 1000);
-        }
-        return true;
     }
 
     function findDailyStreakEntry() {
@@ -2732,6 +2613,11 @@
     const clickActivityCardOnPage = async (item) => {
         const title = (item.title || '').trim();
         const dest = (item.destinationUrl || '').toLowerCase();
+        // URL 安全：活动卡若指向非微软域名（如被篡改的引流/钓鱼链接），跳过这张卡，不点击、不跳转
+        if (dest && !isSafeUrl(dest)) {
+            log(`⏭️ 跳过可疑活动 URL（非微软域名）：${dest.slice(0, 60)}`);
+            return true;
+        }
         log(`  🖱️ 尝试页面内点击完成: ${title || item.offerId}`);
 
         // 页面跳转会销毁当前 async 上下文，跨页面切换由 pending 状态统一恢复。
@@ -3075,10 +2961,7 @@
                         await waitWhilePaused();
                         if (canPageClick) {
                             const clicked = await clickActivityCardOnPage(p);
-        // URL 安全检查：防止跳转到恶意钓鱼页面
-        const dest = p.destinationUrl || '';
-        if (dest && !isSafeUrl(dest)) { log(`⚠️ 拒绝恶意 URL: ${dest.substring(0,60)}`); return false; }
-        if (!clicked) throw new Error('未命中活动卡片');
+                            if (!clicked) throw new Error('未命中活动卡片');
                         } else if (token) {
                             // rewards.bing.com 子活动：标准 ReportActivity（id + hash + 活动Token，值必须 URL 编码）
                             await gmRequest({

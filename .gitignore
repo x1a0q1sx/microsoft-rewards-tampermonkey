@@ -3,3 +3,5 @@ __pycache__/
 *.log
 Thumbs.db
 .DS_Store
+*.backup
+Get_Microsoft_Rewards_v4.user.js
