@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.3.1
-// @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
-// @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55
-// @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55
+// @version      1.0.3.2
+// @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复悬浮窗因缺失常量崩溃的问题）
+// @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
+// @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @author       QingJ
 // @icon         https://rewards.bing.com/rewardscdn/images/rewards.png
 // @match        https://www.bing.com/*
@@ -37,8 +37,8 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.3.1';
-        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.3.1';
+        const SCRIPT_VERSION = '1.0.3.2';
+        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
             'color:#fff;background:#0078d4;padding:2px 8px;border-radius:4px;font-weight:bold');
@@ -99,20 +99,18 @@
     };
     let dashboard = null;
     let loginCookie = '';
-    // 密钥管理键名（普通存储，无需加密）
-    const STORAGE_KEYS = [
-        STORAGE_KEY,          // 搜索进度
-        PENDING_PROMO_KEY,    // 待办活动
-        PROMO_RESUME_KEY,     // 恢复意图
-        TASK_TABS_KEY,        // 任务标签
-        TASK_TAB_STATES_KEY,  // 任务状态
-        DAILY_POINTS_KEY,     // 今日积分
-        AUTO_CLOSE_TAB_KEY    // 自动关闭标记
-    ];
     // 敏感数据加密存储键名
     const ENCRYPTED_KEYS = ['refresh_token', 'auth_code'];
-    // 普通数据存储键名（不含敏感信息）
-    const NORMAL_KEYS = [];
+    // GM 存储键名（沿用历史值，避免升级后丢失待办活动/打卡状态）
+    const PENDING_PROMO_KEY = 'mr_pending_promo';              // 待办活动清单
+    const PROMO_RESUME_KEY = 'mr_promo_resume_intent';         // 跨标签恢复意图
+    const TASK_TABS_KEY = 'mr_task_tabs';                      // 已打开的任务标签
+    const TASK_TAB_STATES_KEY = 'mr_task_tab_states';          // 任务标签状态
+    const AUTO_CLOSE_TAB_KEY = 'mr_auto_close_activity_tabs';  // 自动关闭标记
+    const DAILY_STREAK_STATE_KEY = 'mr_daily_streak_state';    // 每日连续打卡状态
+    const AUTO_CLOSE_TAB_PREFIX = '__MR_AUTO_CLOSE_ACTIVITY__:'; // 自动关闭标记前缀
+    const TASK_TAB_TIMEOUT = 60 * 1000;   // 等待任务标签完成的上限
+    const TASK_TAB_TTL = 10 * 60 * 1000;  // 任务标签状态有效期
     // 默认只在悬浮窗显示关键结果；完整诊断仍保留在代码中，排障时可改为 true。
     const SHOW_DETAIL_LOGS = false;
     const MAX_ACTIVITY_ATTEMPTS = 3;
@@ -450,7 +448,8 @@
         .mr-val { font-weight: 600; color: #333; }
 
         .mr-progress-bg { height: 4px; background: #eee; border-radius: 2px; margin-bottom: 12px; overflow: hidden; }
-        .mr-bar { height: 100%; background: #0078d4; }
+        /* 初始 0 宽：未取到数据前不要画成满格，避免误读为已完成 */
+        .mr-bar { height: 100%; width: 0; background: #0078d4; transition: width .3s ease; }
 
         .mr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
         .mr-btn {

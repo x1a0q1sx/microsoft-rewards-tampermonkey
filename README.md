@@ -26,6 +26,14 @@
 
 也可以直接打开脚本文件，选择使用 Tampermonkey 安装。
 
+已经在用旧版本时，建议直接覆盖安装，别只靠“检查更新”：
+
+```text
+https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
+```
+
+装完后按 F12 打开控制台，第一条日志里的版本号就是当前生效的版本（例如 `v1.0.3.2`）。如果版本号还是旧的，说明浏览器加载的是缓存副本，需要重新导入。
+
 ## 使用
 
 登录 Microsoft Rewards 后，在 Rewards 页面使用悬浮窗中的功能按钮：
@@ -77,6 +85,8 @@ pause: {
 
 如果提示 `invalid_grant: The provided value for the 'code' parameter is not valid`，说明这次授权码已经失效、已被消费，或旧版本把它重复编码了。请先升级到最新版本，然后在悬浮窗里重新点击「获取授权码」完成一次新授权。旧授权码是一次性的，不能刷新或重复使用。
 
+悬浮窗完全不出现，通常是脚本在页面里抛异常提前中断了。先按 F12 看控制台有没有 `Microsoft Rewards 助手 vX 已就绪`：有横幅但没有面板，就把同一条命令的报错发给 Issue；连横幅都没有，一般是版本没更新成功或 Tampermonkey 未在该站点启用。1.0.3.2 修掉了一类典型原因：清理无用代码时误删了几个存储键常量，脚本一执行到活动流程就抛 `ReferenceError`，面板也就建不出来了。
+
 ## 注意事项
 
 - 脚本依赖 Microsoft Rewards 页面结构和接口，页面改版后可能需要调整。
@@ -90,6 +100,23 @@ pause: {
 脚本只在匹配的 Bing、Microsoft Rewards 和登录页面运行，并通过浏览器当前登录状态访问 Rewards 相关页面和接口。项目不提供账号托管，也不应收集或上传账号凭据。
 
 发布到 GitHub 前，请检查代码、Issue、截图和提交历史，确认其中没有 Cookie、Token、账号标识或其他敏感信息。
+
+## 本地自检（贡献者）
+
+改完脚本后，推送前先跑两个零副作用的检查：
+
+```bash
+node tools/check-script.js          # 语法 + 未声明标识符扫描 + 无头执行顶层与按钮回调
+python tools/preview-panel.py       # 用本机 Edge 渲染悬浮窗，输出截图与控制台报错
+```
+
+`check-script.js` 会把面板按钮的点击回调也跑一遍，任何 `ReferenceError`/`TypeError` 都会直接失败退出（`exit 1`），适合挂进 CI。静态扫描依赖 `acorn`，没装会自动跳过：
+
+```bash
+npm i --prefix tools acorn
+```
+
+`preview-panel.py` 会拦截网络、只喂一个 mock 的 `rewards.bing.com/earn` 页面，因此不需要登录就能确认面板 DOM、CSS 和按钮都在；截图写到系统临时目录，控制台同时打印面板尺寸与可见按钮列表。
 
 ## 免责声明
 
