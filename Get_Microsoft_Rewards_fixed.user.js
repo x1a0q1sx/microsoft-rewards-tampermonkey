@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.54
+// @version      1.0.1.55
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复活动跨页面恢复、cookie API 兼容与进度核验）
-// @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.54
-// @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.54
+// @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55
+// @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55
 // @author       QingJ
 // @icon         https://rewards.bing.com/rewardscdn/images/rewards.png
 // @match        https://www.bing.com/*
@@ -37,9 +37,9 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.1.54';
+        const SCRIPT_VERSION = '1.0.1.55';
         // 自动更新地址（与头部 @updateURL 保持一致；改为你自己的托管地址后 Tampermonkey 可一键更新）
-        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.54';
+        const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=1.0.1.55';
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log('%c🔔 Microsoft Rewards 助手 v' + SCRIPT_VERSION + ' 已就绪',
             'color:#fff;background:#0078d4;padding:2px 8px;border-radius:4px;font-weight:bold');
@@ -671,6 +671,7 @@
     }
     if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('导出原始Dashboard JSON', exportRawDashboard, '诊断');
+        GM_registerMenuCommand('扫描页面可执行活动卡片', scanActivityCards, '诊断');
         // 重放最近一次缓存的 dashboard，离线核对 normalizePromotions 抓取逻辑（无需浏览器回传）
         GM_registerMenuCommand('重放最近Dashboard(本地验证)', () => {
             let raw = null;
@@ -2748,6 +2749,37 @@
             }
         }
         log(`ℹ️ 积分暂未刷新，当前 ${state.points} pts`);
+    }
+
+    // 只扫描不点击：列出当前页面真正定位到的可执行卡片，用于定位“活动没完成”。
+    async function scanActivityCards() {
+        if (!isRewardsPage()) {
+            log('⚠️ 请在 rewards.bing.com 页面执行扫描');
+            return null;
+        }
+        await ensureDailyActivityGroup();
+        const nodes = [...document.querySelectorAll('a[href], button, [role=link], [role=button]')];
+        const visible = nodes.filter(el => {
+            if (isAssistantUiElement(el)) return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        });
+        const cards = [];
+        const seen = new Set();
+        for (const el of visible) {
+            const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!text || text.length < 4 || seen.has(text)) continue;
+            const href = el.getAttribute('href') || el.querySelector?.('a[href]')?.getAttribute?.('href') || '';
+            const looksLikeTask = /\+?\d+\s*分|rvreward|rnoreward|\/search\?|每日连续打卡活动|活动|测验|quiz/i.test(text + ' ' + href);
+            const done = /已完成|completed/i.test(text);
+            if (!looksLikeTask || done) continue;
+            seen.add(text);
+            cards.push({ text: text.slice(0, 50), href: href.slice(0, 120) });
+        }
+        log(`🔎 扫描完成：可执行卡片 ${cards.length} 个`);
+        cards.slice(0, 12).forEach((c, i) => log(`   ${i + 1}. ${c.text}`));
+        if (!cards.length) log('   ⚠️ 没有识别到任何可执行卡片，可能当天已完成或页面结构变化');
+        return cards;
     }
 
     const runPromo = async (userInitiated = false) => {
