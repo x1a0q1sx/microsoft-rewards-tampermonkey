@@ -85,6 +85,8 @@ pause: {
 
 如果提示 `invalid_grant: The provided value for the 'code' parameter is not valid`，说明这次授权码已经失效、已被消费，或旧版本把它重复编码了。请先升级到最新版本，然后在悬浮窗里重新点击「获取授权码」完成一次新授权。旧授权码是一次性的，不能刷新或重复使用。
 
+如果出现"页面空白等待 → 提示需要授权码 → 页面刷新 → 再次循环"，请确认版本不低于 `1.1.0.0`。1.1.0.0 之前的版本在 OAuth 回调页与已打开的 Rewards 页之间会**并发兑换同一个一次性授权码**：只有第一个成功，其余必然 `invalid_grant`，于是反复要求重新授权。新版改为回调页只把授权码交接给主页面、由单一页面独占兑换；并且已登录（cookie 会话可用）时不再提示授权。
+
 悬浮窗完全不出现，通常是脚本在页面里抛异常提前中断了。先按 F12 看控制台有没有 `Microsoft Rewards 助手 vX 已就绪`：有横幅但没有面板，就把同一条命令的报错发给 Issue；连横幅都没有，一般是版本没更新成功或 Tampermonkey 未在该站点启用。1.0.3.2 修掉了一类典型原因：清理无用代码时误删了几个存储键常量，脚本一执行到活动流程就抛 `ReferenceError`，面板也就建不出来了。
 
 ## 注意事项
@@ -107,6 +109,7 @@ pause: {
 
 ```bash
 node tools/check-script.js          # 语法 + 未声明标识符扫描 + 无头执行顶层与按钮回调
+node tools/test-auth-handoff.js     # 授权交接回归（防授权码死循环）
 python tools/preview-panel.py       # 用本机 Edge 渲染悬浮窗，输出截图与控制台报错
 ```
 
@@ -117,6 +120,8 @@ npm i --prefix tools acorn
 ```
 
 `preview-panel.py` 会拦截网络、只喂一个 mock 的 `rewards.bing.com/earn` 页面，因此不需要登录就能确认面板 DOM、CSS 和按钮都在；截图写到系统临时目录，控制台同时打印面板尺寸与可见按钮列表。
+
+`test-auth-handoff.js` 用共享桩 `tools/harness.js` 同时模拟"OAuth 回调页"和"另一个已打开的 Rewards 页"，断言同一个授权码最多只被兑换一次、回调页自己不兑换、无 nonce 的第三方回调被忽略、失效 code 不会引发刷新循环。
 
 ## 免责声明
 

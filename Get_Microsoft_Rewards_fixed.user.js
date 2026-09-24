@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.3.2
-// @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（修复悬浮窗因缺失常量崩溃的问题）
+// @version      1.1.0.0
+// @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（重构授权流程：修复授权码死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @author       QingJ
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.0.3.2';
+        const SCRIPT_VERSION = '1.1.0.0';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -368,7 +368,9 @@
                 } else {
                     done('');
                 }
-                setTimeout(() => done(''), 3000);
+                // GM_cookie 在不支持它的脚本管理器里会永不回调；超时给太长会让
+                // 每次数据刷新都白等 3 秒（叠加起来就是"空白等半分钟"）。
+                setTimeout(() => done(''), 800);
             } catch (e) {
                 done('');
             }
@@ -667,7 +669,57 @@
     // 授权相关
     const AUTH_URL = 'https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&response_type=code&redirect_uri=https://login.live.com/oauth20_desktop.srf';
 
-    nodes.btnAuthLink.onclick = () => window.open(AUTH_URL, '_blank');
+    // ========== 授权码：同标签页授权 + GM 存储回传 ==========
+    // 旧做法是在 login.live.com 的回调页里直接拿当前 URL 的 code 去换 token。
+    // 但那个 code 会被**所有**已打开的 rewards 标签页同时读到并各自兑换一次，
+    // 只有第一个成功，其余全是 invalid_grant —— 这正是"要授权码 → 刷新 → 死循环"的根因。
+    // 现在改成：只认带本次 nonce 的码，回传后由**一个**页面独占兑换。
+    const AUTH_NONCE_KEY = 'mr_auth_nonce';
+    const AUTH_CODE_READY_KEY = 'mr_auth_code_ready';
+    const AUTH_NONCE_TTL = 3 * 60 * 1000;
+
+    function makeAuthNonce() {
+        return 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+    }
+
+    function clearAuthHandoff() {
+        GM_setValue(AUTH_NONCE_KEY, '');
+        GM_setValue(AUTH_CODE_READY_KEY, '');
+    }
+
+    // 读回非本页回传的授权码；返回 true 表示已接手上一次授权
+    function consumeAuthHandoff() {
+        try {
+            const raw = GM_getValue(AUTH_CODE_READY_KEY, '');
+            if (!raw) return false;
+            const rec = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (!rec || !rec.code) return false;
+            if (rec.consumedBy && rec.consumedBy !== TOKEN_EXCHANGE_OWNER) return false;
+            if (Date.now() - Number(rec.at || 0) > AUTH_NONCE_TTL) { clearAuthHandoff(); return false; }
+            if (rec.consumedBy === TOKEN_EXCHANGE_OWNER) return false;
+            // 本页还没换过 token，就由本页独占这笔 code，其它标签页不会重复兑换
+            if (state.accessToken) return false;
+            rec.consumedBy = TOKEN_EXCHANGE_OWNER;
+            GM_setValue(AUTH_CODE_READY_KEY, JSON.stringify(rec));
+            safeSetValue('auth_code', rec.code);
+            log('🔑 收到授权码，由本页换取令牌...');
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    nodes.btnAuthLink.onclick = () => {
+        // 同标签页跳转授权，不再新开标签页：新标签页容易在登录后丢失登录态，
+        // 且回调页与主页面并发兑换同一个 code。
+        const nonce = makeAuthNonce();
+        GM_setValue(AUTH_NONCE_KEY, nonce);
+        GM_setValue(AUTH_CODE_READY_KEY, '');
+        const url = new URL(AUTH_URL);
+        url.searchParams.set('mr_nonce', nonce);
+        log('🔗 正在本标签页打开微软授权页，授权完成后自动返回...');
+        location.href = url.href;
+    };
 
     // 从完整 URL 或直接授权码中稳健提取 code
     // URL 里的 code 是 percent-encoded；先解码一次，后续兑换时再编码一次。
@@ -976,6 +1028,20 @@
             try {
                 let data = null, source = null;
 
+                // 0) OAuth Bearer（仅当已存在令牌时）。把令牌路径放在最前只是为了
+                // 网络更省；真正的关键在下面：cookie 路径一旦拿到数据就直接跳过令牌，
+                // 不会因为"没配 OAuth"而反复弹授权框。已登录用户本来就用不上 OAuth。
+                if (state.accessToken && Date.now() < (state.accessTokenExpiresAt || 0) - 60000) {
+                    try {
+                        const d = await fetchDashboardViaToken(state.accessToken);
+                        if (d?.dashboard?.userStatus || d?.response?.userStatus) {
+                            data = d; source = 'Bearer'; lastDashboardSource = source;
+                        }
+                    } catch (e) {
+                        if (e?.status === 401) { state.accessToken = null; state.accessTokenExpiresAt = 0; }
+                    }
+                }
+
                 // 1) rewards.bing.com 会话 cookie（结构最全：含 dailySet/morePromotions）
                 try {
                     const cookie = await getCookies('https://rewards.bing.com');
@@ -1090,9 +1156,15 @@
                 }
 
                 if (!data) {
+                    // 没有过期令牌、cookie 也拿不到数据时，才认为需要授权。
+                    // 已登录浏览器上 cookie 路径通常直接可用，不该弹授权框更不该刷新页面。
+                    if (state.accessTokenExpiresAt && Date.now() < state.accessTokenExpiresAt) {
+                        log('⚠️ 令牌仍有效但接口未返回数据，稍后自动重试（不弹授权框）');
+                        return;
+                    }
                     state.authNeeded = true;
                     nodes.boxAuth.style.display = 'block';
-                    log('⚠️ 获取数据失败：请登录 rewards.bing.com 或完成 OAuth 授权');
+                    log('⚠️ 未取到数据：若已登录 rewards.bing.com，请稍等自动重试；长期失败再考虑 OAuth 授权');
                     return;
                 }
 
@@ -3239,33 +3311,69 @@
         }
     };
 
-    // ========== 自动捕获 OAuth 回调（login.live.com/oauth20_desktop.srf?code=...） ==========
-    // 点完“获取授权码”跳到该页后，无需手动复制 URL，脚本自动提取并换取令牌
-    (function autoCaptureAuth() {
-        try {
-            const staleAuthCode = safeGetValue('auth_code');
-            if (staleAuthCode && /^https?:\/\//i.test(staleAuthCode) && !staleAuthCode.includes('code=')) {
+    // ========== OAuth 回调页：只负责"接住 code 并回传"，不在本页兑换 ==========
+    // 关键点：
+    //   1. 只有带本次 nonce 的回调才处理 —— 避免任何已打开的标签页都去抢同一个 code；
+    //   2. 不在这里换 token —— 回调页换完后如果失败就刷新，会和其它页互相打转；
+    //   3. 立刻回主页 —— 主页拿到 code 后一次性兑换并写进 GM 存储，之后所有页面共用 refresh_token。
+    function handleAuthCallback() {
+        const onCallbackHost = /(^|\.)login\.live\.com$/i.test(location.hostname);
+        if (!onCallbackHost) return false;
+
+        const params = new URLSearchParams(location.search);
+        const nonce = params.get('mr_nonce') || '';
+        const code = extractAuthCode(location.href);
+        if (!code) {
+            const err = params.get('error');
+            if (err) {
+                log('❌ 授权被拒绝: ' + err + (params.get('error_description') ? ' - ' + params.get('error_description') : ''));
+                clearAuthHandoff();
                 safeSetValue('auth_code', '');
-                GM_setValue('auth_code_claim', '');
             }
-            const code = extractAuthCode(location.href);
-            // 同一废 code 不要反复捕获兑换（避免刷新该页面时死循环）
-            if (code && GM_getValue('auth_code_bad') !== code) {
-                safeSetValue('auth_code', code);
-                state.authNeeded = false;
-                nodes.boxAuth.style.display = 'none';
-                if (typeof GM_notification === 'function') {
-                    GM_notification({ title: 'Microsoft Rewards', text: '✅ 授权码已自动捕获，正在换取令牌...' });
-                }
-                log('✅ 已自动捕获授权码，正在换取令牌...');
-                (async () => {
-                    const token = await getAccessToken({ preferCode: true });
-                    if (token) { await updateData(); log('🔑 自动授权成功'); }
-                    else { nodes.boxAuth.style.display = 'block'; state.authNeeded = true; }
-                })();
+            return false;
+        }
+
+        const expected = GM_getValue(AUTH_NONCE_KEY, '');
+        if (!expected || !nonce || nonce !== expected) {
+            // 不是本脚本发起的授权（或 nonce 已过期）：既不兑换也不跳转，交回给用户
+            log('ℹ️ 检测到一个非本脚本发起的授权回调，已忽略（未兑换，避免重复消费）');
+            return false;
+        }
+
+        if (GM_getValue('auth_code_bad') === code) {
+            log('⚠️ 该授权码已确认失效，请重新点击「🔗 获取授权码」');
+            clearAuthHandoff();
+            safeSetValue('auth_code', '');
+            return true;
+        }
+
+        GM_setValue(AUTH_CODE_READY_KEY, JSON.stringify({
+            code,
+            nonce,
+            at: Date.now(),
+            consumedBy: ''
+        }));
+        GM_setValue(AUTH_NONCE_KEY, '');
+        log('✅ 已捕获授权码，正在返回 Rewards 完成兑换...');
+        showAuthOverlay('已获取授权码，正在返回 Rewards 页面…');
+        setTimeout(() => {
+            try { location.replace(getRewardsResumeUrl('')); } catch (_) { location.href = 'https://rewards.bing.com/earn'; }
+        }, 400);
+        return true;
+    }
+
+    function showAuthOverlay(text) {
+        try {
+            let box = document.getElementById('mr-auth-overlay');
+            if (!box) {
+                box = document.createElement('div');
+                box.id = 'mr-auth-overlay';
+                box.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;background:#fff;border:1px solid #ddd;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.16);padding:18px 22px;font:14px/1.6 "Segoe UI",sans-serif;color:#333;text-align:center';
+                (document.body || document.documentElement).appendChild(box);
             }
-        } catch (e) { /* ignore */ }
-    })();
+            box.textContent = text;
+        } catch (_) {}
+    }
 
     function showTaskTabOverlay(text) {
         try {
@@ -3304,10 +3412,26 @@
     // Init
     (async () => {
         try {
+            // 0) 活动任务页 / OAuth 回调页：处理完立即返回，不进入正常数据流程
             if (handleRewardsTaskTab()) return;
+            if (handleAuthCallback()) return;
+
             const isTrackedActivityTab = markCurrentAutoCloseActivityTab();
             startAutoCloseActivityTabMonitor();
             loginCookie = await getCookies('https://login.live.com');
+
+            // 主页接手一次刚回传的授权码，独占兑换
+            if (consumeAuthHandoff()) {
+                const token = await getAccessToken({ preferCode: true });
+                if (token) {
+                    state.authNeeded = false;
+                    nodes.boxAuth.style.display = 'none';
+                    log('🔑 授权成功，令牌已保存');
+                } else {
+                    log('⚠️ 自动兑换失败，请在悬浮窗里重新获取授权码');
+                }
+            }
+
             await updateData();
             // 青龙/计划任务自动执行入口：
             // 用 Edge 打开 https://rewards.bing.com/?mr_auto_run=1 时，

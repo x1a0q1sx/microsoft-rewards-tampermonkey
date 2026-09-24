@@ -124,137 +124,21 @@ if (acorn) {
 
 console.log('');
 console.log('[2] 顶层执行（极简 DOM/GM 桩）');
-const ids = new Map();
-const missingSelectors = [];
-const registerHtml = (html) => {
-    const re = /id\s*=\s*["']([^"']+)["']/g;
-    let m;
-    while ((m = re.exec(html))) if (!ids.has(m[1])) { const e = mkEl('div'); e.id = m[1]; }
-};
-const q = (sel) => {
-    if (typeof sel !== 'string') return null;
-    const s = sel.trim();
-    if (s.charAt(0) === '#') {
-        const id = s.slice(1).split(/[[\s:.[#]/)[0];
-        const hit = ids.get(id) || null;
-        if (!hit && !missingSelectors.includes(id)) missingSelectors.push(id);
-        return hit;
-    }
-    return mkEl('div');
-};
-function mkEl(tag) {
-    let _id = '';
-    let _html = '';
-    const el = {
-        tagName: String(tag || 'div').toUpperCase(), className: '', textContent: '', value: '', checked: false, href: '',
-        style: new Proxy({}, { set: (t, k, v) => { t[k] = v; return true; }, get: (t, k) => (t[k] === undefined ? '' : t[k]) }),
-        dataset: {}, children: [], childNodes: [], _h: {},
-        appendChild(c) { this.children.push(c); return c; },
-        removeChild(c) { return c; },
-        insertAdjacentHTML(_p, html) { registerHtml(String(html)); },
-        setAttribute(k, v) { if (k === 'id') el.id = v; },
-        getAttribute(k) { return k === 'id' ? _id : null; },
-        remove() {}, focus() {}, click() {}, blur() {}, select() {},
-        closest() { return null; }, matches() { return false; },
-        querySelector: (s) => q(s), querySelectorAll: () => [],
-        getBoundingClientRect: () => ({ top: 0, left: 0, width: 100, height: 100, right: 100, bottom: 100 }),
-        scrollTop: 0, scrollHeight: 100, offsetHeight: 100, offsetWidth: 100, clientHeight: 100,
-        offsetParent: null, parentNode: null, parentElement: null, nextSibling: null, firstChild: null,
-        dispatchEvent: () => true,
-    };
-    ['change', 'input', 'click', 'keydown', 'mousedown', 'load', 'error', 'scroll'].forEach(ev => {
-        Object.defineProperty(el, 'on' + ev, {
-            get: () => (Array.isArray(el._h[ev]) ? el._h[ev][0] : el._h[ev]),
-            set: (fn) => { el._h[ev] = fn; },
-        });
-    });
-    el.addEventListener = (ev, fn) => { const a = (el._h[ev] = el._h[ev] || []); if (!a.includes(fn)) a.push(fn); };
-    el.removeEventListener = () => {};
-    Object.defineProperty(el, 'id', { get: () => _id, set: (v) => { _id = String(v); if (_id) ids.set(_id, el); } });
-    Object.defineProperty(el, 'innerHTML', { get: () => _html, set: (v) => { _html = String(v); registerHtml(_html); } });
-    Object.defineProperty(el, 'outerHTML', { get: () => _html, set: () => {} });
-    return el;
-}
-
-const store = new Map();
-const storage = {
-    getItem: (k) => (store.has(k) ? store.get(k) : null),
-    setItem: (k, v) => store.set(k, String(v)),
-    removeItem: (k) => store.delete(k),
-    clear: () => store.clear(),
-};
-const documentStub = {
-    readyState: 'complete', title: 'Microsoft Rewards', cookie: '', visibilityState: 'visible', hidden: false,
-    documentElement: mkEl('html'), head: mkEl('head'), body: mkEl('body'),
-    createElement: mkEl, createTextNode: (t) => ({ nodeValue: t }), createDocumentFragment: () => mkEl('fragment'),
-    querySelector: q, querySelectorAll: () => [], getElementById: (id) => ids.get(id) || null,
-    addEventListener() {}, removeEventListener() {}, execCommand: () => true,
-};
-const locationStub = {
-    href: 'https://rewards.bing.com/earn', protocol: 'https:', host: 'rewards.bing.com', hostname: 'rewards.bing.com',
-    origin: 'https://rewards.bing.com', pathname: '/earn', search: '', hash: '', reload() {},
-    assign(u) { locationStub.href = String(u); }, replace(u) { locationStub.href = String(u); },
-    toString: () => 'https://rewards.bing.com/earn',
-};
-const sandbox = {
-    console: { log() {}, warn() {}, error() {}, info() {}, debug() {} },
-    document: documentStub, location: locationStub, localStorage: storage, sessionStorage: storage,
-    navigator: {
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-        language: 'zh-CN', languages: ['zh-CN'], platform: 'Win32',
-        clipboard: { writeText: () => Promise.resolve() }, sendBeacon: () => true,
-    },
-    history: { pushState() {}, replaceState() {}, back() {}, forward() {}, go() {}, state: null, length: 1 },
-    crypto: { getRandomValues: (a) => { for (let i = 0; i < a.length; i++) a[i] = i % 251; return a; }, randomUUID: () => 'uuid-check' },
-    MutationObserver: class { observe() {} disconnect() {} takeRecords() { return []; } },
-    IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
-    ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
-    getComputedStyle: () => ({ getPropertyValue: () => '', display: 'block' }),
-    matchMedia: () => ({ matches: false, addEventListener() {}, addListener() {} }),
-    XMLHttpRequest: function () { this.open = () => {}; this.send = () => {}; this.setRequestHeader = () => {}; this.addEventListener = () => {}; },
-    setTimeout: () => 1, clearTimeout() {}, setInterval: () => 2, clearInterval() {},
-    requestAnimationFrame: () => 3, cancelAnimationFrame() {},
-    queueMicrotask: (fn) => { try { fn(); } catch (_) {} },
-    addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true,
-    open: () => ({ closed: false, close() {}, focus() {}, location: { href: '', assign() {}, replace() {} } }),
-    close() {}, focus() {}, blur() {}, scrollTo() {}, scrollBy() {}, postMessage() {},
-    innerWidth: 1920, innerHeight: 1080, devicePixelRatio: 1, scrollX: 0, scrollY: 0, name: '', closed: false,
-    encodeURIComponent, decodeURIComponent, encodeURI, decodeURI, isNaN, isFinite, parseFloat, parseInt,
-    btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
-    atob: (s) => Buffer.from(s, 'base64').toString('binary'),
-    fetch: () => Promise.reject(new Error('check-script: 网络请求已禁用')),
-    TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, DataView, URL, URLSearchParams, Blob, FormData,
-    Image: function () { return mkEl('img'); },
-    GM_info: { script: { name: 'check', uuid: 'check' }, version: 'check' },
-    GM_getValue: (k, d) => (store.has(k) ? store.get(k) : (d === undefined ? undefined : d)),
-    GM_setValue: (k, v) => store.set(k, v),
-    GM_deleteValue: (k) => store.delete(k),
-    GM_listValues: () => Array.from(store.keys()),
-    GM_addStyle: () => mkEl('style'),
-    GM_registerMenuCommand: () => {},
-    GM_openInTab: (url) => ({ closed: false, close() {}, focus() {}, url: String(url) }),
-    GM_getResourceText: () => '', GM_getResourceURL: () => '', GM_log: () => {},
-    GM_notification: () => {}, GM_setClipboard: () => {}, GM_download: () => {},
-    GM_xmlhttpRequest: (d) => { if (d && typeof d.onerror === 'function') { try { d.onerror({ status: 0, statusText: 'check-script-blocked' }); } catch (_) {} } return { abort() {} }; },
-};
-sandbox.window = sandbox;
-sandbox.self = sandbox;
-sandbox.globalThis = sandbox;
-sandbox.top = sandbox.parent = sandbox;
-sandbox.unsafeWindow = sandbox;
-
-const PANEL_BUTTONS = ['btn-search', 'btn-promo', 'btn-read', 'btn-all', 'btn-sign', 'mr-auth-link', 'mr-auth-save'];
+const { createHarness } = require('./harness');
+const harness = createHarness({ url: 'https://rewards.bing.com/earn', runTimers: false });
+const ids = harness.ids;
+const missingSelectors = harness.missingSelectors;
 try {
-    const ctx = vm.createContext(sandbox);
-    new vm.Script(src, { filename: target }).runInContext(ctx);
+    harness.run(src);
     note(true, '顶层执行无异常');
 } catch (e) {
     const at = e && e.stack ? String(e.stack).split('\n')[1] : '';
     note(false, '顶层执行抛错', (e && e.message ? e.message : String(e)) + (at ? ' @' + at.trim() : ''));
 }
-
 note(missingSelectors.length === 0, '面板元素全部命中',
     missingSelectors.length ? '未找到 #' + missingSelectors.join(', #') : ids.size + ' 个 id 已注册');
+
+const PANEL_BUTTONS = ['btn-search', 'btn-promo', 'btn-read', 'btn-all', 'btn-sign', 'mr-auth-link', 'mr-auth-save'];
 
 console.log('');
 console.log('[3] 按钮处理函数');
