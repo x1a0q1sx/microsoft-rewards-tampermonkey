@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1.0
+// @version      1.1.1.1
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（新增跨刷新调试日志：刷新后自动回放上一页日志并审计跳转原因）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.1.0';
+        const SCRIPT_VERSION = '1.1.1.1';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -729,6 +729,15 @@
         nodes.logBox.scrollTop = nodes.logBox.scrollHeight;
     };
 
+    // 展示用 URL 清洗：抹掉 code/nonce 等敏感参数，保留 client_id/redirect_uri 等能定位"跳转来源"的参数
+    function dbgSafeUrl(u, max = 150) {
+        try {
+            const url = new URL(u);
+            ['code', 'mr_nonce', 'client_secret', 'access_token', 'refresh_token', 'session_state'].forEach(k => url.searchParams.delete(k));
+            return url.href.slice(0, max);
+        } catch (_) { return String(u || '').slice(0, max); }
+    }
+
     // 导航对账：新页面加载时判断"上一页为什么离开"。
     // 返回结论字符串（也写进持久缓冲）；一次性导航意图读后即清。
     function reconcileNavigationAudit() {
@@ -739,7 +748,7 @@
         if (nav && nav.s !== DBG_SESSION_ID && now - (nav.ts || 0) < 90 * 1000) {
             verdict = `🚨 上次跳转由脚本发起：「${nav.reason}」（${nav.p} → ${String(nav.to).slice(0, 80)}）`;
         } else if (unload && unload.s !== DBG_SESSION_ID && now - (unload.ts || 0) < 5 * 60 * 1000) {
-            verdict = `🚨 上次页面离开未经脚本导航点（${unload.p} @ ${new Date(unload.ts).toLocaleTimeString()}，busy=${unload.busy}）——疑似站点自身跳转/刷新或页内点击导航`;
+            verdict = `🚨 上次页面离开未经脚本导航点（${unload.p} @ ${new Date(unload.ts).toLocaleTimeString()}，busy=${unload.busy}）\n← 来自: ${dbgSafeUrl(unload.url)}\n——疑似站点自身跳转/刷新或页内点击导航`;
         }
         try { GM_setValue(DBG_NAV_KEY, ''); } catch (_) {}
         if (verdict) dbgAppendLog(verdict, 'audit');
@@ -765,7 +774,7 @@
             nodes.logBox.appendChild(divider);
             const addLine = (text, color) => {
                 const div = document.createElement('div');
-                div.style.cssText = color ? `color:${color};font-weight:600` : 'color:#888';
+                div.style.cssText = color ? `color:${color};font-weight:600;white-space:pre-line` : 'color:#888;white-space:pre-line';
                 div.textContent = text;
                 nodes.logBox.appendChild(div);
             };
@@ -3603,6 +3612,16 @@
             // 必须在最早的时机做——若本页随后自动跳转，面板日志又会丢。
             const navAudit = reconcileNavigationAudit();
             replayPreviousSessionLogs(navAudit);
+
+            // 站点自身的登录弹跳（rewards↔login.live.com 来回跳）会经过授权页。
+            // client_id 能直接回答"这次授权是谁发起的"：是脚本、还是微软 Rewards 网页自己。
+            if (/(^|\.)login\.live\.com$/i.test(location.hostname) && /oauth20_authorize/.test(location.pathname)) {
+                const authParams = new URLSearchParams(location.search);
+                const clientId = authParams.get('client_id') || '(无)';
+                const redirectUri = authParams.get('redirect_uri') || '(无)';
+                const initiator = clientId === '0000000040170455' ? '本脚本' : '微软页面自身/其它客户端';
+                log(`🔎 本次授权页由 ${initiator} 发起（client_id=${clientId} redirect_uri=${dbgSafeUrl(redirectUri, 90)}）`);
+            }
 
             // 0) 活动任务页 / OAuth 回调页：处理完立即返回，不进入正常数据流程
             if (handleRewardsTaskTab()) return;
