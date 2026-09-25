@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0.0
-// @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（重构授权流程：修复授权码死循环）
+// @version      1.1.1.0
+// @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（新增跨刷新调试日志：刷新后自动回放上一页日志并审计跳转原因）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @author       QingJ
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.0.0';
+        const SCRIPT_VERSION = '1.1.1.0';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -115,6 +115,114 @@
     const SHOW_DETAIL_LOGS = false;
     const MAX_ACTIVITY_ATTEMPTS = 3;
     const DAILY_STREAK_KEY_VERSION = 2;
+
+    // ========== 调试审计层（跨页面刷新持久化） ==========
+    // 背景：面板日志只存在于 DOM，页面一刷新/跳转就全部丢失，"第二个活动执行后界面刷新"
+    // 这类问题无从定位。此层把三类证据写进 GM 存储（所有标签页共享），刷新后自动对账播报：
+    //   1) 持久日志环形缓冲：含被 SHOW_DETAIL_LOGS 过滤掉的细节，跨标签页按页面标记交织；
+    //   2) 导航意图：脚本每次主动跳转前先落盘"谁为什么跳"；
+    //   3) 离页快照 + 末次点击：pagehide 时记录，可判断"非脚本导航点的离开"并配对到具体点击。
+    const DBG_LOG_KEY = 'mr_debug_log';
+    const DBG_NAV_KEY = 'mr_nav_intent';
+    const DBG_UNLOAD_KEY = 'mr_last_unload';
+    const DBG_CLICK_KEY = 'mr_last_click';
+    const DBG_MAX_ENTRIES = 400;
+    const DBG_SESSION_ID = Math.random().toString(36).slice(2, 8) + '-' + Date.now().toString(36).slice(-4);
+    const DBG_PAGE_TAG = (() => {
+        try {
+            const h = location.hostname.replace(/^(www|cn)\./, '');
+            const p = location.pathname === '/' ? '' : location.pathname.slice(0, 24);
+            return h + p;
+        } catch (_) { return String(location.href).slice(0, 40); }
+    })();
+
+    function dbgReadJSON(key, fallback) {
+        try {
+            const raw = GM_getValue(key, '');
+            return raw ? JSON.parse(raw) : fallback;
+        } catch (_) { return fallback; }
+    }
+
+    function dbgAppendLog(msg, tag = 'ui') {
+        try {
+            const list = dbgReadJSON(DBG_LOG_KEY, []);
+            if (!Array.isArray(list)) return;
+            list.push({
+                t: Date.now(), s: DBG_SESSION_ID, p: DBG_PAGE_TAG,
+                g: tag, m: String(msg).replace(/\s+/g, ' ').slice(0, 300)
+            });
+            GM_setValue(DBG_LOG_KEY, JSON.stringify(list.slice(-DBG_MAX_ENTRIES)));
+        } catch (_) {}
+    }
+
+    // 细节日志：不进面板（避免刷屏），只进持久缓冲，供「导出调试日志」排查用
+    const dbg = (msg) => dbgAppendLog(msg, 'detail');
+
+    // 任何脚本主动导航前调用：落盘"谁为什么跳转"。新页面 init 时会读取并清除。
+    function markNavIntent(reason, to) {
+        try {
+            GM_setValue(DBG_NAV_KEY, JSON.stringify({
+                reason: String(reason).slice(0, 120),
+                to: String(to || '').slice(0, 200),
+                from: String(location.href).slice(0, 200),
+                ts: Date.now(), s: DBG_SESSION_ID, p: DBG_PAGE_TAG
+            }));
+        } catch (_) {}
+        dbgAppendLog(`🧭 [导航] ${reason} → ${String(to || '').slice(0, 120)}`, 'nav');
+    }
+
+    // 页面离开（刷新/跳转/关闭）前的最后一条快照。GM_setValue 是同步 API，unload 阶段也能落盘。
+    function recordPageHide() {
+        try {
+            GM_setValue(DBG_UNLOAD_KEY, JSON.stringify({
+                url: String(location.href).slice(0, 200), ts: Date.now(),
+                s: DBG_SESSION_ID, p: DBG_PAGE_TAG,
+                busy: !!(state.running || state.allRunning || (state.busyCount > 0)),
+                vis: document.visibilityState
+            }));
+        } catch (_) {}
+    }
+
+    // 全局点击嗅探（capture 阶段）：页面因点击跳走时，"末次点击"与离页快照配对即可定位元凶。
+    // 脚本自身 humanClickElement 的点击同样会被记录（这正是需要证据的对象）。
+    function installDebugHooks() {
+        try {
+            document.addEventListener('click', (e) => {
+                try {
+                    const el = (e.target && e.target.closest) ? (e.target.closest('a, button, [role=link], [role=button]') || e.target) : e.target;
+                    if (!el || (typeof el.closest === 'function' && el.closest('#mr-panel'))) return;
+                    GM_setValue(DBG_CLICK_KEY, JSON.stringify({
+                        ts: Date.now(), s: DBG_SESSION_ID, p: DBG_PAGE_TAG,
+                        tag: el.tagName || '?',
+                        text: String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+                        href: String(el.getAttribute?.('href') || el.querySelector?.('a[href]')?.getAttribute?.('href') || '').slice(0, 160),
+                        target: String(el.getAttribute?.('target') || el.querySelector?.('a')?.getAttribute?.('target') || ''),
+                        x: e.clientX || 0, y: e.clientY || 0
+                    }));
+                } catch (_) {}
+            }, true);
+            window.addEventListener('pagehide', recordPageHide, true);
+            window.addEventListener('pageshow', (e) => {
+                if (e && e.persisted) dbgAppendLog('🧊 页面从 bfcache 恢复（脚本定时器/异步可能已失效）', 'nav');
+            });
+        } catch (_) {}
+    }
+    installDebugHooks();
+
+    GM_registerMenuCommand('🧾 导出调试日志(控制台)', () => {
+        try {
+            const list = dbgReadJSON(DBG_LOG_KEY, []);
+            const style = 'color:#0078d4;font-weight:bold';
+            console.log(`%c===== MR 调试日志（${list.length} 条，本页会话=${DBG_SESSION_ID}）=====`, style);
+            list.forEach(e => {
+                const who = e.s === DBG_SESSION_ID ? '本页' : '他页';
+                console.log(`[${new Date(e.t).toLocaleTimeString()}][${e.p}][${who}][${e.g}] ${e.m}`);
+            });
+            console.log('nav_intent:', dbgReadJSON(DBG_NAV_KEY, null));
+            console.log('last_unload:', dbgReadJSON(DBG_UNLOAD_KEY, null));
+            console.log('last_click:', dbgReadJSON(DBG_CLICK_KEY, null));
+        } catch (e) { console.error('导出调试日志失败', e); }
+    });
     const getActivityTitle = item => String(
         item?.title || item?.attributes?.title || item?.offerId || item?.attributes?.offerid || '未知活动'
     ).replace(/\s+/g, ' ').trim().slice(0, 40);
@@ -610,6 +718,7 @@
         ].some(pattern => pattern.test(text));
     };
     const log = (msg) => {
+        dbgAppendLog(msg, 'ui');   // 先落盘持久缓冲（刷新不丢），再按现有规则进面板
         if (isDetailLog(msg)) return;
         const div = document.createElement('div');
         div.textContent = `[${new Date().toLocaleTimeString().slice(0, 5)}] ${msg}`;
@@ -619,6 +728,61 @@
         }
         nodes.logBox.scrollTop = nodes.logBox.scrollHeight;
     };
+
+    // 导航对账：新页面加载时判断"上一页为什么离开"。
+    // 返回结论字符串（也写进持久缓冲）；一次性导航意图读后即清。
+    function reconcileNavigationAudit() {
+        const now = Date.now();
+        const nav = dbgReadJSON(DBG_NAV_KEY, null);
+        const unload = dbgReadJSON(DBG_UNLOAD_KEY, null);
+        let verdict = '';
+        if (nav && nav.s !== DBG_SESSION_ID && now - (nav.ts || 0) < 90 * 1000) {
+            verdict = `🚨 上次跳转由脚本发起：「${nav.reason}」（${nav.p} → ${String(nav.to).slice(0, 80)}）`;
+        } else if (unload && unload.s !== DBG_SESSION_ID && now - (unload.ts || 0) < 5 * 60 * 1000) {
+            verdict = `🚨 上次页面离开未经脚本导航点（${unload.p} @ ${new Date(unload.ts).toLocaleTimeString()}，busy=${unload.busy}）——疑似站点自身跳转/刷新或页内点击导航`;
+        }
+        try { GM_setValue(DBG_NAV_KEY, ''); } catch (_) {}
+        if (verdict) dbgAppendLog(verdict, 'audit');
+        const click = dbgReadJSON(DBG_CLICK_KEY, null);
+        let clickLine = '';
+        if (click && unload && click.s === unload.s && Math.abs(click.ts - unload.ts) < 60 * 1000) {
+            clickLine = `🖱️ 上一页末次点击: <${click.tag}> "${click.text}" href=${click.href || '(无)'} target=${click.target || '(无)'}`;
+            dbgAppendLog(clickLine, 'audit');
+        }
+        return { verdict, clickLine };
+    }
+
+    // 上一页日志回放：把缓冲里其它页面会话（最近 30 分钟）的日志画进本页面板，
+    // 刷新/跳转后用户不用打开控制台就能看到"刷新前发生了什么"。
+    function replayPreviousSessionLogs(audit) {
+        try {
+            const list = dbgReadJSON(DBG_LOG_KEY, []);
+            if (!Array.isArray(list)) return;
+            const prev = list.filter(e => e && e.s !== DBG_SESSION_ID && Date.now() - (e.t || 0) < 30 * 60 * 1000);
+            const divider = document.createElement('div');
+            divider.style.cssText = 'color:#0078d4;border-top:1px dashed #bbb;margin:4px 0 2px;padding-top:3px;font-weight:600';
+            divider.textContent = prev.length ? `📋 上一页日志（近 ${Math.min(prev.length, 40)} 条）` : '📋 上一页日志（无记录）';
+            nodes.logBox.appendChild(divider);
+            const addLine = (text, color) => {
+                const div = document.createElement('div');
+                div.style.cssText = color ? `color:${color};font-weight:600` : 'color:#888';
+                div.textContent = text;
+                nodes.logBox.appendChild(div);
+            };
+            if (audit.verdict) addLine(audit.verdict, '#d83b01');
+            if (audit.clickLine) addLine(audit.clickLine, '#d83b01');
+            prev.slice(-40).forEach(e => {
+                // detail 类只进缓冲供导出；ui 类若命中高频过滤规则也不回放，避免面板刷屏
+                if (e.g === 'detail' || isDetailLog(e.m)) return;
+                addLine(`[${new Date(e.t).toLocaleTimeString().slice(0, 8)}][${String(e.p || '?').slice(0, 18)}] ${e.m}`);
+            });
+            const endMark = document.createElement('div');
+            endMark.style.cssText = 'color:#0078d4;border-bottom:1px dashed #bbb;margin:2px 0 4px;font-weight:600';
+            endMark.textContent = '📋 以上为上一页日志 · 以下是本页';
+            nodes.logBox.appendChild(endMark);
+            nodes.logBox.scrollTop = nodes.logBox.scrollHeight;
+        } catch (_) {}
+    }
 
     const updateAllButton = () => {
         if (!nodes.btnAll) return;
@@ -718,6 +882,7 @@
         const url = new URL(AUTH_URL);
         url.searchParams.set('mr_nonce', nonce);
         log('🔗 正在本标签页打开微软授权页，授权完成后自动返回...');
+        markNavIntent('用户点击获取授权码，跳转授权页', url.href);
         location.href = url.href;
     };
 
@@ -1993,9 +2158,11 @@
             // 正在跑的这轮活动随之被销毁（表现为来回跳页、活动一个都做不完）。
             // 这里强制改成新标签打开：目标页照样加载，主页面还能继续跑下一张卡。
             const anchorTarget = String(target.getAttribute('target') || '').toLowerCase();
-            if (!['_blank', '_new'].includes(anchorTarget)) {
+            const forced = !['_blank', '_new'].includes(anchorTarget);
+            if (forced) {
                 try { target.setAttribute('target', '_blank'); } catch (_) {}
             }
+            dbg(`真实点击<a> "${String(target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)}" href=${String(target.getAttribute('href') || '').slice(0, 100)} ${forced ? `target:${anchorTarget || '无'}→_blank(已强制新标签)` : `target=${anchorTarget}(原生新标签)`}`);
             try { target.click(); } catch (_) {}
             return true;
         }
@@ -2043,6 +2210,7 @@
         await sleep(700);
 
         try { window.open = originalOpen; } catch (_) {}
+        dbg(`合成点击<${target.tagName}> "${String(target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)}" window.open=${opened ? '已触发' : '未触发'}${opened ? '' : ' → 兜底 target.click()（非锚点元素，若站点处理器做整页导航将中断本轮）'}`);
         if (!opened) {
             try { target.click(); } catch (_) {}
         }
@@ -2120,7 +2288,10 @@
 
     function markCurrentAutoCloseActivityTab() {
         const marker = findCurrentAutoCloseMarker();
-        if (!marker) return false;
+        if (!marker) {
+            dbg(`自动关闭标记未命中当前URL=${String(location.href).slice(0, 110)}（现有标记${readAutoCloseTabs().length}个${readAutoCloseTabs().length ? ': ' + readAutoCloseTabs().map(m => String(m.url).slice(0, 60)).join(' | ') : ''}）`);
+            return false;
+        }
         autoCloseMarkerId = marker.id;
         autoCloseMarkerKind = marker.kind || 'subtask';
         autoCloseMarkerOpenedInNewTab = marker.openedInNewTab !== false;
@@ -2612,9 +2783,11 @@
                 card.scrollIntoView({ block: 'center', inline: 'center' });
                 await sleep(250);
                 // 每日连续打卡子卡在侧边栏内，按真实点击处理，不强制跳转。
+                dbg(`打卡子卡点击 ${taskNumber}/3: "${text.slice(0, 30)}" tag=<${card.tagName}> href=${String(getCardHref(card)).slice(0, 90)} target=${getCardTarget(card) || '无'}`);
                 await humanClickElement(card);
                 await sleep(700);
                 const result = await waitForDailyStreakCardResult(panel, key, beforeProgress, 6000);
+                dbg(`打卡子卡结果 ${taskNumber}/3: registered=${result.registered} progress=${result.progress == null ? '未读到' : result.progress} panel仍在=${!!result.panel}`);
                 panel = result.panel;
                 const progress = result.progress;
                 const registered = result.registered;
@@ -2769,10 +2942,13 @@
             const taskId = uuid();
             if (href) addTaskTab(taskId, href);
             const savedRel = stripNoopener(card);
+            dbg(`点击卡片: title="${title.slice(0, 30)}" href=${String(href).slice(0, 100)} anchorTarget=${(anchor?.getAttribute?.('target') || '无')} taskId=${href ? taskId : '无(无href不等待)'}`);
+            const clickStart = Date.now();
             await humanClickElement(card);
             setTimeout(() => restoreNoopener(savedRel), 5000);
             if (href) {
                 const done = await waitTaskTabDone(taskId, TASK_TAB_TIMEOUT);
+                dbg(`任务标签等待结果: done=${done} 耗时=${Math.round((Date.now() - clickStart) / 1000)}s taskId=${taskId}`);
                 log(done
                     ? `  ✅ 任务页已完成并关闭：${title || item.offerId}`
                     : `  ⚠️ 未收到任务页完成回报：${title || item.offerId}`);
@@ -2781,6 +2957,7 @@
             await sleep(5000);
             return true;
         } catch (e) {
+            dbg(`卡片点击异常: ${e.message}`);
             log('  ❌ click 失败: ' + e.message);
             return false;
         }
@@ -2971,12 +3148,14 @@
         if (pageItems.length) {
             // 无论当前是否已在 rewards 页，都先保存待办，防止点击或导航导致脚本上下文被卸载。
             savePendingPromo(webItems);
+            dbg(`待办已保存(${webItems.length}项): ${webItems.map(getActivityTitle).join(' | ').slice(0, 220)}`);
             if (!isRewardsPage()) {
                 // 只有用户主动点击“活动/每日活动签到/一键执行”才设置恢复意图。
                 setPromoResumeIntent();
                 log('🧭 活动卡片需要在 Rewards 页面点击，正在跳转并准备自动恢复...');
                 nodes.btnPromo.disabled = false;
                 markBusy(-1);
+                markNavIntent('活动卡片需在Rewards页点击，跳转Rewards', 'https://rewards.bing.com/earn');
                 location.href = 'https://rewards.bing.com/earn';
                 return;
             }
@@ -3010,6 +3189,7 @@
             log('✅ 所有 web 活动已完成！');
         } else {
         log(`📅 检测到 ${taskList.length} 个待执行活动(web)`);
+        dbg(`web待执行: ${taskList.map(p => `${getActivityTitle(p)}<${String(p.destinationUrl || '').slice(0, 60)}>`).join(' | ').slice(0, 280)}`);
 
         let count = 0;
         for (const p of taskList) {
@@ -3357,6 +3537,7 @@
         log('✅ 已捕获授权码，正在返回 Rewards 完成兑换...');
         showAuthOverlay('已获取授权码，正在返回 Rewards 页面…');
         setTimeout(() => {
+            markNavIntent('授权回调页返回Rewards兑换', getRewardsResumeUrl(''));
             try { location.replace(getRewardsResumeUrl('')); } catch (_) { location.href = 'https://rewards.bing.com/earn'; }
         }, 400);
         return true;
@@ -3392,7 +3573,13 @@
         const pending = readTaskTabs();
         if (!pending.length) return false;
         const hit = pending.find(matchTaskTab);
-        if (!hit) return false;
+        if (!hit) {
+            // 有未完成任务标记但当前 URL 不匹配：这是"活动页跳走后主页面干等 60 秒"的高发场景，
+            // 记下当前 URL 与待匹配标记，供导出日志对账。
+            dbg(`任务页标记未命中当前URL=${String(location.href).slice(0, 110)} 待匹配=[${pending.map(i => String(i.url).slice(0, 80)).join(' | ')}]`);
+            return false;
+        }
+        dbg(`任务页命中标记 id=${hit.id} url=${String(hit.url).slice(0, 100)}`);
 
         // 立即消费，避免 www→cn 重定向第二次命中。
         writeTaskTabs(pending.filter(item => item.id !== hit.id));
@@ -3412,12 +3599,18 @@
     // Init
     (async () => {
         try {
+            // 调试审计：先对账"上一页为什么离开"，再把上一页日志回放进面板。
+            // 必须在最早的时机做——若本页随后自动跳转，面板日志又会丢。
+            const navAudit = reconcileNavigationAudit();
+            replayPreviousSessionLogs(navAudit);
+
             // 0) 活动任务页 / OAuth 回调页：处理完立即返回，不进入正常数据流程
             if (handleRewardsTaskTab()) return;
             if (handleAuthCallback()) return;
 
             const isTrackedActivityTab = markCurrentAutoCloseActivityTab();
             startAutoCloseActivityTabMonitor();
+            dbg(`init: trackedTab=${isTrackedActivityTab} kind=${autoCloseMarkerKind || '-'} openedInNewTab=${autoCloseMarkerOpenedInNewTab} resumeIntent=${hasPromoResumeIntent()} pending=${readPendingPromo()?.items?.length || 0} url=${String(location.href).slice(0, 110)}`);
             loginCookie = await getCookies('https://login.live.com');
 
             // 主页接手一次刚回传的授权码，独占兑换
@@ -3462,9 +3655,11 @@
             // 新开的活动标签页只负责让目标页面完成计分并等待主页面关闭。
             // 若它也恢复 runPromo，会与主页面并发点击，出现 1、2、2 而漏掉第 3 张卡。
             if (pending && hasPromoResumeIntent()) {
+                dbg(`恢复分流: trackedTab=${isTrackedActivityTab} openedInNewTab=${autoCloseMarkerOpenedInNewTab} rewardsPage=${isRewardsPage()} host=${location.hostname}`);
                 if (isTrackedActivityTab && !autoCloseMarkerOpenedInNewTab) {
                     log('⏳ 活动页已打开，先等待 12 秒计分，再返回 Rewards...');
                     await sleep(12000);
+                    markNavIntent('活动页(同标签)计分完成，返回Rewards', getRewardsResumeUrl(autoCloseMarkerId));
                     location.replace(getRewardsResumeUrl(autoCloseMarkerId));
                     return;
                 } else if (isTrackedActivityTab) {
@@ -3475,6 +3670,7 @@
                     await runPromo(false);
                 } else if (/(^|\.)bing\.com$/i.test(location.hostname)) {
                     log('↩️ 继续前往 Rewards 页面完成刚才主动开始的活动...');
+                    markNavIntent('bing活动页恢复流程，跳转Rewards', getRewardsResumeUrl(''));
                     location.href = getRewardsResumeUrl('');
                 }
             } else if (pending) {
