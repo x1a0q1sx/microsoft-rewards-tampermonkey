@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1.2
-// @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（新增跨刷新调试日志：刷新后自动回放上一页日志并审计跳转原因）
+// @version      1.1.2.0
+// @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @author       QingJ
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.1.2';
+        const SCRIPT_VERSION = '1.1.2.0';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -79,6 +79,9 @@
         todayEarned: 0, todayEarnedSource: '',
         taskTabCompleted: 0,
         running: false,
+        // rewards.bing.com 会话健康度：true=接口正常；false=接口 401（页面内点击会被站点弹到登录页）；
+        // null=未知（不要因为未知就改变原有行为）
+        rewardsSessionOk: null,
         accessToken: null,
         accessTokenExpiresAt: 0,
         updating: false,
@@ -239,6 +242,7 @@
     let lastDataLogSignature = '';
     let lastDashboardSource = '';
     let lastQuotaLogSignature = '';
+    let rewardsSessionWarned = false;   // 会话 401 只提示一次，避免刷屏
 
     // ========== 进度保存/恢复 ==========
     const STORAGE_KEY = 'mr_search_progress';
@@ -752,6 +756,12 @@
         }
         try { GM_setValue(DBG_NAV_KEY, ''); } catch (_) {}
         if (verdict) dbgAppendLog(verdict, 'audit');
+        // 非脚本导航点导致的离开 + 目的地是登录页 = 站点登录弹跳：计入熔断统计。
+        // 只在"确实被弹去登录"时计数，避免把普通页面重绘/站点常规跳转误判。
+        if (unload && unload.s !== DBG_SESSION_ID && now - (unload.ts || 0) < 5 * 60 * 1000 &&
+            /(^|\.)login\.live\.com$/i.test(location.hostname) && !(nav && nav.s !== DBG_SESSION_ID && now - (nav.ts || 0) < 90 * 1000)) {
+            notePromoBounce(`非脚本跳转 → ${location.hostname}`);
+        }
         const click = dbgReadJSON(DBG_CLICK_KEY, null);
         let clickLine = '';
         if (click && unload && click.s === unload.s && Math.abs(click.ts - unload.ts) < 60 * 1000) {
@@ -1238,12 +1248,29 @@
                     }
                     if (r) {
                         const d = JSON.parse(r);
-                        if (d && (d.dashboard?.userStatus || d.response?.userStatus)) { data = d; source = 'cookie'; lastDashboardSource = source; }
-                    } else if (lastErr && lastErr.status !== 401) {
+                        if (d && (d.dashboard?.userStatus || d.response?.userStatus)) {
+                            data = d; source = 'cookie'; lastDashboardSource = source;
+                            state.rewardsSessionOk = true;
+                        } else {
+                            state.rewardsSessionOk = false;
+                        }
+                    } else if (lastErr && lastErr.status === 401) {
+                        // rewards.bing.com 会话无效：此后页面内点击会被站点弹去登录页，
+                        // 这是"点活动就整页跳登录"的土壤，必须显式标记并停止页面点击流程。
+                        state.rewardsSessionOk = false;
+                    } else if (lastErr) {
                         log('🍪 getuserinfo: ' + lastErr.message);
                     }
                 } catch (e) {
-                    if (e.status !== 401) log('🍪 getuserinfo: ' + e.message);
+                    if (e.status === 401) state.rewardsSessionOk = false;
+                    else log('🍪 getuserinfo: ' + e.message);
+                }
+                if (state.rewardsSessionOk === false && !rewardsSessionWarned) {
+                    rewardsSessionWarned = true;
+                    log('⚠️ rewards.bing.com 会话已失效（接口 401）：站点会把你弹到登录页，已暂停页面点击类活动；请先在该站点重新登录或改用「获取授权码」');
+                    dbg('会话健康: cookie getuserinfo 401 → 暂停页面点击路径（防站点 OAuth 弹跳）');
+                } else if (state.rewardsSessionOk === true) {
+                    rewardsSessionWarned = false;   // 会话恢复后允许再次告警
                 }
 
                 // Bing Flyout 兜底：Chrome 下旧 API/移动 API 可能缺失 PCSearch 计数器
@@ -2023,6 +2050,43 @@
         GM_setValue(PROMO_RESUME_KEY, JSON.stringify({ createdAt: Date.now() }));
     }
 
+    // ========== 防弹跳熔断 ==========
+    // 站点在会话失效时会把活动页弹去登录；脚本的「自动恢复」若立刻再跑一轮，就会
+    // 形成"弹走→恢复→再点→再弹"的死循环。这里记录连续弹跳次数：
+    // 短时间内达到上限就停止自动恢复，只提示用户先重新登录。
+    const PROMO_BOUNCE_KEY = 'mr_promo_bounce';
+    const PROMO_BOUNCE_WINDOW = 10 * 60 * 1000;   // 统计窗口
+    const PROMO_BOUNCE_LIMIT = 2;                 // 窗口内允许的弹跳次数，超过即熔断
+
+    function readPromoBounceState() {
+        try {
+            const raw = GM_getValue(PROMO_BOUNCE_KEY, '');
+            const data = raw ? JSON.parse(raw) : null;
+            if (!data?.firstAt || Date.now() - data.firstAt > PROMO_BOUNCE_WINDOW) {
+                return { count: 0, firstAt: Date.now() };
+            }
+            return { count: Number(data.count) || 0, firstAt: data.firstAt };
+        } catch (_) {
+            return { count: 0, firstAt: Date.now() };
+        }
+    }
+
+    function notePromoBounce(reason) {
+        const s = readPromoBounceState();
+        s.count += 1;
+        GM_setValue(PROMO_BOUNCE_KEY, JSON.stringify(s));
+        dbg(`弹跳计数 ${s.count}/${PROMO_BOUNCE_LIMIT}（${reason}）`);
+        return s.count;
+    }
+
+    function clearPromoBounceState() {
+        GM_setValue(PROMO_BOUNCE_KEY, '');
+    }
+
+    function isPromoBounceTripped() {
+        return readPromoBounceState().count >= PROMO_BOUNCE_LIMIT;
+    }
+
     function hasPromoResumeIntent() {
         try {
             const raw = GM_getValue(PROMO_RESUME_KEY, '');
@@ -2146,6 +2210,15 @@
 
     async function humanClickElement(el) {
         if (!el) return false;
+        // 统一会话闸门：rewards 会话失效（接口 401）时，站点会在任意卡片点击时把整页弹去
+        // 它自己的 OAuth（client 9c941f7c → /auth/callback）。日志实证：按钮型卡片
+        //（<BUTTON> "每日连续打卡活动 …"）没有 href，无法用 target=_blank 兜住，
+        // 点击必然导致主页面销毁。此时任何点击都是徒劳，直接跳过并留证据。
+        if (state.rewardsSessionOk === false && isRewardsPage()) {
+            const label = String((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40));
+            dbg(`会话闸门: humanClickElement 跳过点击 <${el.tagName}> "${label}"（rewardsSessionOk=false）`);
+            return false;
+        }
         try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
         await sleep(randomRange(260, 620));
         const doc = el.ownerDocument || document;
@@ -2229,6 +2302,29 @@
                 return originalOpen.apply(window, args);
             };
         } catch (_) {}
+
+        // 非锚点元素（如 <BUTTON> 卡片）没有 href/target，浏览器没有"新标签"默认行为可借。
+        // 站点的点击处理器若做整页导航，主页面必被销毁。这里在捕获阶段拦掉站点的处理器，
+        // 由脚本自己按需打开目标（有 href 就新标签打开；没有就不导航），保证上下文存活。
+        const btnHref = String(target.getAttribute?.('href')
+            || target.querySelector?.('a[href]')?.getAttribute?.('href') || '');
+        let removeBtnGuard = null;
+        if (/^https?:\/\/(www\.|cn\.)?bing\.com\//i.test(btnHref)) {
+            const guard = (e) => {
+                try {
+                    const t = e.target;
+                    if (t === el || (t && typeof el.contains === 'function' && el.contains(t))) {
+                        e.stopImmediatePropagation();
+                        e.preventDefault();
+                        dbg(`🛡️ 已拦截按钮卡片的站点处理器（防同页跳转），改由脚本新标签打开: ${btnHref.slice(0, 90)}`);
+                        try { window.open(btnHref, '_blank'); } catch (_) {}
+                    }
+                } catch (_) {}
+            };
+            try { document.addEventListener('click', guard, true); } catch (_) {}
+            removeBtnGuard = () => { try { document.removeEventListener('click', guard, true); } catch (_) {} };
+            setTimeout(removeBtnGuard, 8000);
+        }
 
         fire('pointerover');
         fire('mouseover', { buttons: 0 });
@@ -2914,6 +3010,17 @@
             return false;
         }
 
+        // 会话失效闸门（核心防护）：rewards.bing.com 接口 401 时，页面里的活动卡片点击会被
+        // 站点自身弹到 login.live.com（client 9c941f7c → /auth/callback），主页面整个被销毁，
+        // 恢复流程再点同一张卡 → 无限弹跳。此时页面点击必然徒劳，直接闸掉并给出明确指引，
+        // 让流程改用不依赖站点的 dapi 路径或请用户重新登录。
+        // 只用明确的 false（已探测到 401）；null/未知不改变原有行为。
+        if (state.rewardsSessionOk === false) {
+            dbg(`会话闸门: 跳过页面点击 "${title}"（rewardsSessionOk=false）`);
+            log(`⛔ 跳过页面点击（rewards 会话已失效，点击会被站点弹到登录页）：${title || item.offerId}`);
+            return false;
+        }
+
         // “每日连续打卡活动”不是普通单卡：先打开侧边栏，再点击其中的 3 张子卡。
         // 之前这里只点击外壳，所以只能看到侧边栏，活动进度不会增加。
         if (isDailyStreakActivityItem(item)) {
@@ -3224,6 +3331,13 @@
 
         if (taskList.length === 0) {
             log('✅ 所有 web 活动已完成！');
+        } else if (state.rewardsSessionOk === false) {
+            // 会话失效时任何一个卡片点击都会被站点弹去登录页——这里直接止步，
+            // 避免"点第一张 → 整页跳登录 → 恢复 → 再点"的循环。
+            log(`⛔ 检测到 ${taskList.length} 个 web 活动，但 rewards 会话已失效：暂停页面点击`);
+            log('👉 请在当前站点重新登录一次（或点「🔗 获取授权码」），登录后重试「活动」');
+            dbg(`会话闸门: web 活动 ${taskList.length} 项全部跳过（rewardsSessionOk=false）`);
+            clearPendingPromo();
         } else {
         log(`📅 检测到 ${taskList.length} 个待执行活动(web)`);
         dbg(`web待执行: ${taskList.map(p => `${getActivityTitle(p)}<${String(p.destinationUrl || '').slice(0, 60)}>`).join(' | ').slice(0, 280)}`);
@@ -3703,7 +3817,15 @@
             // 若它也恢复 runPromo，会与主页面并发点击，出现 1、2、2 而漏掉第 3 张卡。
             if (pending && hasPromoResumeIntent()) {
                 dbg(`恢复分流: trackedTab=${isTrackedActivityTab} openedInNewTab=${autoCloseMarkerOpenedInNewTab} rewardsPage=${isRewardsPage()} host=${location.hostname}`);
-                if (isTrackedActivityTab && !autoCloseMarkerOpenedInNewTab) {
+                // 熔断：上一页若在"非脚本导航"下离开（站点自己弹走），且短时间内已发生多次，
+                // 就不要再自动恢复了——否则会持续"弹走→恢复→再弹"。
+                if (!isTrackedActivityTab && isPromoBounceTripped()) {
+                    const st = readPromoBounceState();
+                    log(`🛑 检测到 ${st.count} 次非脚本弹跳（站点登录跳转），已停止自动恢复活动`);
+                    log('👉 请先在本站点完成登录（或点「🔗 获取授权码」），再手动点「活动」继续');
+                    dbg('恢复熔断生效：不再自动 runPromo');
+                    clearPromoResumeIntent();
+                } else if (isTrackedActivityTab && !autoCloseMarkerOpenedInNewTab) {
                     log('⏳ 活动页已打开，先等待 12 秒计分，再返回 Rewards...');
                     await sleep(12000);
                     markNavIntent('活动页(同标签)计分完成，返回Rewards', getRewardsResumeUrl(autoCloseMarkerId));
