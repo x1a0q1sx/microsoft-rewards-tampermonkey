@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1.1
+// @version      1.1.1.2
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（新增跨刷新调试日志：刷新后自动回放上一页日志并审计跳转原因）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.1.1';
+        const SCRIPT_VERSION = '1.1.1.2';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -2162,6 +2162,28 @@
         } catch (_) {}
 
         const isAnchor = target.tagName === 'A' && target.hasAttribute?.('href');
+        // 目的地是 bing 内容页的卡片（如连续打卡子卡 href=bing.com/search?q=…）计分只依赖
+        // "访问该 URL"；但站点的 React 处理器会 preventDefault 并在【当前标签】做跳转——
+        // rewards 会话一失效，这个跳转就被站点自己的 OAuth（client 9c941f7c →
+        // rewards.bing.com/auth/callback）弹走，主页面整个被销毁（"第二个活动后界面刷新"）。
+        // 在捕获阶段拦下站点处理器（stopImmediatePropagation），浏览器就会按
+        // target=_blank 的默认行为开新标签：目的地不变，主页面原地不动。
+        const guardHref = isAnchor ? String(target.getAttribute('href') || '') : '';
+        let removeClickGuard = null;
+        if (isAnchor && /^https?:\/\/(www\.|cn\.)?bing\.com\//i.test(guardHref)) {
+            const guard = (e) => {
+                try {
+                    const t = e.target;
+                    if (t === el || (t && typeof el.contains === 'function' && el.contains(t))) {
+                        e.stopImmediatePropagation();
+                        dbg(`🛡️ 已拦截站点点击处理器（防同页跳转），由浏览器默认行为开新标签: ${guardHref.slice(0, 90)}`);
+                    }
+                } catch (_) {}
+            };
+            try { document.addEventListener('click', guard, true); } catch (_) {}
+            removeClickGuard = () => { try { document.removeEventListener('click', guard, true); } catch (_) {} };
+            setTimeout(removeClickGuard, 8000);
+        }
         if (isAnchor) {
             // 没有 target=_blank 的卡片直接 click() 会把当前 Rewards 页整个跳走，
             // 正在跑的这轮活动随之被销毁（表现为来回跳页、活动一个都做不完）。
@@ -2171,7 +2193,7 @@
             if (forced) {
                 try { target.setAttribute('target', '_blank'); } catch (_) {}
             }
-            dbg(`真实点击<a> "${String(target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)}" href=${String(target.getAttribute('href') || '').slice(0, 100)} ${forced ? `target:${anchorTarget || '无'}→_blank(已强制新标签)` : `target=${anchorTarget}(原生新标签)`}`);
+            dbg(`真实点击<a> "${String(target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)}" href=${String(target.getAttribute('href') || '').slice(0, 100)} ${forced ? `target:${anchorTarget || '无'}→_blank(已强制新标签)` : `target=${anchorTarget}(原生新标签)`}${removeClickGuard ? ' [已布防点击拦截]' : ''}`);
             try { target.click(); } catch (_) {}
             return true;
         }
@@ -2792,7 +2814,13 @@
                 card.scrollIntoView({ block: 'center', inline: 'center' });
                 await sleep(250);
                 // 每日连续打卡子卡在侧边栏内，按真实点击处理，不强制跳转。
-                dbg(`打卡子卡点击 ${taskNumber}/3: "${text.slice(0, 30)}" tag=<${card.tagName}> href=${String(getCardHref(card)).slice(0, 90)} target=${getCardTarget(card) || '无'}`);
+                // 子卡目的地是 bing 搜索页：登记任务标记，让新开的标签自报完成并自动关闭，
+                // 不再靠主页面事后收拾（此前子卡标签会一直滞留）。
+                const subHref = getCardHref(card);
+                if (subHref && /^https?:\/\/(www\.|cn\.)?bing\.com\//i.test(subHref)) {
+                    addTaskTab(uuid(), subHref);
+                }
+                dbg(`打卡子卡点击 ${taskNumber}/3: "${text.slice(0, 30)}" tag=<${card.tagName}> href=${String(subHref).slice(0, 90)} target=${getCardTarget(card) || '无'}`);
                 await humanClickElement(card);
                 await sleep(700);
                 const result = await waitForDailyStreakCardResult(panel, key, beforeProgress, 6000);
