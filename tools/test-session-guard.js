@@ -9,7 +9,7 @@
  * 覆盖：
  *   [1] 非脚本跳转到登录页 → 计一次弹跳
  *   [2] 弹跳达到上限 → 停止自动恢复（不再自动 runPromo）
- *   [3] 会话 401 时不应出现任何卡片点击
+ *   [3] 会话 401：不再硬闸点击（2026-09-29 策略更新），有明确存疑提示且无旧闸门文案
  *   [4] 会话正常时不改变原有行为（不误伤）
  *
  * 用法：node tools/test-session-guard.js
@@ -95,19 +95,19 @@ const debugLog = store => {
         check(p.h.navigations.filter(u => u === 'reload').length === 0, '没有触发刷新');
     }
 
-    // ---------- [3] 会话 401：不产生任何卡片点击 ----------
+    // ---------- [3] 会话 401：不再硬闸点击（存疑继续 + 熔断兜底） ----------
     {
-        console.log('\n[3] 会话 401：不应出现卡片点击（防站点弹登录）');
+        console.log('\n[3] 会话 401：不硬闸点击（策略更新 2026-09-29），有存疑提示、无旧闸门文案');
         const store = new Map();
         const p = page(store, 'https://rewards.bing.com/earn');
         await drain();
         p.h.click('btn-promo');
         await drain();
         const log = debugLog(store);
-        check(log.includes('会话已失效') || log.includes('会话闸门') || log.includes('请先获取授权码'),
-            '明确说明会话失效/需授权，而不是静默尝试点击',
+        check(log.includes('会话已失效'), '仍明确提示会话存疑（401 告警保留）',
             (log.split('\n').find(l => l.includes('会话已失效')) || '(无会话提示)').slice(0, 90));
-        check(!log.includes('🖱️ 尝试页面内点击完成'), '没有任何卡片点击尝试');
+        check(!log.includes('暂停页面点击'), '旧硬闸文案已移除（不再一刀切拦截）');
+        check(!p.err, '顶层无异常', p.err && p.err.message);
     }
 
     // ---------- [4] 会话正常时不误伤 ----------

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.2.3
+// @version      1.1.3.0
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.2.3';
+        const SCRIPT_VERSION = '1.1.3.0';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -1403,10 +1403,10 @@
                 }
                 if (state.rewardsSessionOk === false && !rewardsSessionWarned) {
                     rewardsSessionWarned = true;
-                    log(`⚠️ rewards.bing.com 会话已失效（getuserinfo ${sessionDiag || 'HTTP ?'}）：站点会把你弹到登录页，已暂停页面点击类活动；请先在该站点重新登录或改用「获取授权码」。注意：若站点页面自己也反复弹登录（积分闪现/消失），多为服务端拒绝建立会话（区域/账号策略），重登录无效`);
-                    dbg('会话健康: cookie getuserinfo 失败 → 暂停页面点击路径（防站点 OAuth 弹跳）');
+                    log(`⚠️ rewards.bing.com 会话已失效（getuserinfo ${sessionDiag || 'HTTP ?'}）：页面活动将照常尝试（若被站点弹登录，弹跳熔断会自动停止）。注意：若站点页面自己也反复弹登录（积分闪现/消失），多为服务端拒绝建立会话（区域/账号策略），重登录无效`);
+                    dbg('会话健康: cookie getuserinfo 失败 → 记录存疑状态（2026-09-29 起不再硬闸点击，由熔断兜底）');
                 } else if (state.rewardsSessionOk === true) {
-                    if (rewardsSessionWarned) log('✅ rewards 会话已恢复，页面点击类活动已解除暂停');
+                    if (rewardsSessionWarned) log('✅ rewards 会话已恢复（getuserinfo 200），弹跳熔断已复位');
                     rewardsSessionWarned = false;   // 会话恢复后允许再次告警
                     clearPromoBounceState();        // 会话恢复，弹跳熔断一并复位
                 }
@@ -2348,15 +2348,11 @@
 
     async function humanClickElement(el) {
         if (!el) return false;
-        // 统一会话闸门：rewards 会话失效（接口 401）时，站点会在任意卡片点击时把整页弹去
-        // 它自己的 OAuth（client 9c941f7c → /auth/callback）。日志实证：按钮型卡片
-        //（<BUTTON> "每日连续打卡活动 …"）没有 href，无法用 target=_blank 兜住，
-        // 点击必然导致主页面销毁。此时任何点击都是徒劳，直接跳过并留证据。
-        if (state.rewardsSessionOk === false && isRewardsPage()) {
-            const label = String((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40));
-            dbg(`会话闸门: humanClickElement 跳过点击 <${el.tagName}> "${label}"（rewardsSessionOk=false）`);
-            return false;
-        }
+        // 注：rewardsSessionOk===false 时不再在此硬闸点击（2026-09-29 策略更新）。
+        // 实测门户接口 getuserinfo?type=1 被服务端策略性 401（区域/账号层），但站点会话
+        // 可用窗口内页面卡片点击照常计分（用户实证「每日连续打卡活动可点击拿分」）。
+        // 防弹跳由两层兜底：①bing.com 目的地强制新标签打开，主页面不被销毁；
+        // ②弹跳熔断（10 分钟内 2 次非脚本弹跳 → 停止自动恢复）。
         try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
         await sleep(randomRange(260, 620));
         const doc = el.ownerDocument || document;
@@ -3148,15 +3144,11 @@
             return false;
         }
 
-        // 会话失效闸门（核心防护）：rewards.bing.com 接口 401 时，页面里的活动卡片点击会被
-        // 站点自身弹到 login.live.com（client 9c941f7c → /auth/callback），主页面整个被销毁，
-        // 恢复流程再点同一张卡 → 无限弹跳。此时页面点击必然徒劳，直接闸掉并给出明确指引，
-        // 让流程改用不依赖站点的 dapi 路径或请用户重新登录。
-        // 只用明确的 false（已探测到 401）；null/未知不改变原有行为。
+        // 会话存疑提示（2026-09-29 起不再硬闸点击）：getuserinfo?type=1 被服务端策略性
+        // 401（区域/账号层）时页面卡片仍可能照常计分，防弹跳交给熔断与新标签强制兜底
+        // （详见 humanClickElement 处注释）。
         if (state.rewardsSessionOk === false) {
-            dbg(`会话闸门: 跳过页面点击 "${title}"（rewardsSessionOk=false）`);
-            log(`⛔ 跳过页面点击（rewards 会话已失效，点击会被站点弹到登录页）：${title || item.offerId}`);
-            return false;
+            dbg(`会话存疑: 仍尝试页面点击 "${title}"（rewardsSessionOk=false，熔断兜底）`);
         }
 
         // “每日连续打卡活动”不是普通单卡：先打开侧边栏，再点击其中的 3 张子卡。
@@ -3469,14 +3461,14 @@
 
         if (taskList.length === 0) {
             log('✅ 所有 web 活动已完成！');
-        } else if (state.rewardsSessionOk === false) {
-            // 会话失效时任何一个卡片点击都会被站点弹去登录页——这里直接止步，
-            // 避免"点第一张 → 整页跳登录 → 恢复 → 再点"的循环。
-            log(`⛔ 检测到 ${taskList.length} 个 web 活动，但 rewards 会话已失效：暂停页面点击`);
-            log('👉 请在当前站点重新登录一次（或点「🔗 获取授权码」），登录后重试「活动」');
-            dbg(`会话闸门: web 活动 ${taskList.length} 项全部跳过（rewardsSessionOk=false）`);
-            clearPendingPromo();
         } else {
+            if (state.rewardsSessionOk === false) {
+                // 2026-09-29 策略更新：不再因接口 401 硬闸点击。门户接口被服务端策略性
+                // 401（区域/账号层），但站点会话可用窗口内卡片点击照常计分（用户实证）。
+                // 防弹跳由熔断兜底：10 分钟内 2 次非脚本弹跳 → 停止自动恢复。
+                log(`⚠️ rewards 会话存疑（接口 401），仍尝试执行 ${taskList.length} 个 web 活动；若被弹登录，弹跳熔断会自动停止`);
+                dbg(`会话存疑仍执行: web 活动 ${taskList.length} 项（rewardsSessionOk=false，熔断兜底）`);
+            }
         log(`📅 检测到 ${taskList.length} 个待执行活动(web)`);
         dbg(`web待执行: ${taskList.map(p => `${getActivityTitle(p)}<${String(p.destinationUrl || '').slice(0, 60)}>`).join(' | ').slice(0, 280)}`);
 
