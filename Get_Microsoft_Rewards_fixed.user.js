@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.2.1
+// @version      1.1.2.2
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.2.1';
+        const SCRIPT_VERSION = '1.1.2.2';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -396,9 +396,10 @@
                         timeout: 20000,
                         ...options,
                         onload: xhr => {
-                            // 诊断模式：无论状态码都返回 {status, text, finalUrl}，不吞 4xx/3xx 真实响应
+                            persistRotatedCookies(xhr.responseHeaders, options.url, xhr.finalUrl);
+                            // 诊断模式：无论状态码都返回 {status, text, finalUrl, headers}，不吞 4xx/3xx 真实响应
                             if (options.withStatus) {
-                                resolve({ status: xhr.status, text: xhr.responseText, finalUrl: xhr.finalUrl });
+                                resolve({ status: xhr.status, text: xhr.responseText, finalUrl: xhr.finalUrl, headers: xhr.responseHeaders || '' });
                             } else if (xhr.status >= 200 && xhr.status < 300) {
                                 resolve(options.returnUrl ? xhr.finalUrl : xhr.responseText);
                             } else if (xhr.status >= 300 && xhr.status < 400) {
@@ -431,6 +432,128 @@
                 await sleep(delay + randomRange(0, 250));
             }
         }
+    }
+
+    // ========== rewards 会话 cookie 轮换回写 ==========
+    // rewards.bing.com 的接口会在响应里用 Set-Cookie 轮换会话令牌 _RwBf/_RwBf.corr：
+    // 页面自己的请求由浏览器自动保存新值，而 GM_xmlhttpRequest 的响应不会写进浏览器
+    // cookie jar —— 脚本每调一次接口，jar 里留下的就是被服务端作废的旧令牌，页面自己
+    // 的下一个请求立刻 401，站点随即把用户弹去它自己的 OAuth（client 9c941f7c）。
+    // 这里在 GM 响应里捕获轮换并代写回 jar（只针对 _RwBf*；日志只记 cookie 名，绝不记值）。
+    const PERSIST_COOKIE_NAMES = ['_RwBf', '_RwBf.corr'];
+    const lastPersistedCookie = new Map();   // name -> 上次已写回的值（仅内存，避免重复写）
+    let persistCookieNoticeShown = false;
+
+    function hostOfUrl(u) {
+        try { return new URL(String(u), location.href).hostname || ''; } catch { return ''; }
+    }
+
+    function parseSetCookiePairs(headerStr) {
+        const out = [];
+        if (!headerStr) return out;
+        for (const line of String(headerStr).split(/\r?\n/)) {
+            const m = line.match(/^\s*set-cookie\s*:\s*(.+?)\s*$/i);
+            if (!m) continue;
+            const segs = m[1].split(';').map(s => s.trim());
+            const eq = segs[0].indexOf('=');
+            if (eq <= 0) continue;
+            const c = { name: segs[0].slice(0, eq).trim(), value: segs[0].slice(eq + 1).trim(), expired: false };
+            for (const at of segs.slice(1)) {
+                const i = at.indexOf('=');
+                const k = (i < 0 ? at : at.slice(0, i)).trim().toLowerCase();
+                const v = i < 0 ? '' : at.slice(i + 1).trim();
+                if (k === 'domain') c.domain = v;
+                else if (k === 'path') c.path = v;
+                else if (k === 'secure') c.secure = true;
+                else if (k === 'httponly') c.httpOnly = true;
+                else if (k === 'max-age') { const n = parseInt(v, 10); if (!isNaN(n)) { c.expirationDate = Math.floor(Date.now() / 1000) + n; if (n <= 0) c.expired = true; } }
+                else if (k === 'expires') { const t = Date.parse(v); if (!isNaN(t)) { c.expirationDate = Math.floor(t / 1000); if (t <= Date.now()) c.expired = true; } }
+            }
+            if (c.name) out.push(c);
+        }
+        return out;
+    }
+
+    function persistRotatedCookies(responseHeaders, reqUrl, finalUrl) {
+        try {
+            if (!responseHeaders) return;
+            const host = hostOfUrl(reqUrl) || hostOfUrl(finalUrl);
+            if (!/(^|\.)bing\.com$/i.test(host)) return;
+            const pairs = parseSetCookiePairs(responseHeaders).filter(c => PERSIST_COOKIE_NAMES.includes(c.name));
+            if (!pairs.length) return;
+            for (const c of pairs) {
+                if (lastPersistedCookie.get(c.name) === c.value) continue;
+                lastPersistedCookie.set(c.name, c.value);
+                try {
+                    if (typeof GM_cookie !== 'undefined' && GM_cookie) {
+                        const details = {
+                            url: 'https://rewards.bing.com/',
+                            name: c.name,
+                            value: c.value,
+                            domain: c.domain || '.bing.com',
+                            path: c.path || '/',
+                            secure: c.secure !== false,
+                            httpOnly: !!c.httpOnly
+                        };
+                        if (c.expirationDate) details.expirationDate = c.expirationDate;
+                        if (c.expired || !c.value) {
+                            if (typeof GM_cookie.delete === 'function') GM_cookie.delete({ url: details.url, name: c.name }, () => {});
+                            else if (typeof GM_cookie === 'function') GM_cookie('delete', { url: details.url, name: c.name }, () => {});
+                        } else if (typeof GM_cookie.set === 'function') {
+                            GM_cookie.set(details, () => {});
+                        } else if (typeof GM_cookie === 'function') {
+                            GM_cookie('set', details, () => {});
+                        }
+                    }
+                } catch (_) {}
+                dbg(`捕获上游 Set-Cookie 轮换 ${c.name}${c.expired ? '（清除）' : ''}，已代写回浏览器 jar`);
+                if (!persistCookieNoticeShown) {
+                    persistCookieNoticeShown = true;
+                    log('🔁 捕获 rewards 会话 cookie 轮换并已写回浏览器（GM 请求不会自动保存上游 Set-Cookie；此前浏览器会一直留着作废令牌，页面随即被弹登录）');
+                }
+            }
+        } catch (_) {}
+    }
+
+    function listCookieNames(url) {
+        return new Promise(resolve => {
+            let settled = false;
+            const done = v => { if (!settled) { settled = true; resolve(Array.isArray(v) ? v : []); } };
+            try {
+                if (typeof GM_cookie === 'undefined' || !GM_cookie) return done([]);
+                const cb = cookies => done((cookies || []).map(c => c.name));
+                if (typeof GM_cookie.list === 'function') GM_cookie.list({ url }, cb);
+                else if (typeof GM_cookie === 'function') GM_cookie('list', { url }, cb);
+                else done([]);
+                // GM_cookie 在不支持它的脚本管理器里会永不回调；超时给太长会让
+                // 每次数据刷新都白等 3 秒（叠加起来就是"空白等半分钟"）。
+                setTimeout(() => done([]), 800);
+            } catch { done([]); }
+        });
+    }
+
+    // 会话失效诊断串：真实状态码 + 服务端错误语义 + 浏览器 jar 里 rewards 域 cookie
+    // 存在性（只看名字不看值）+ 响应是否要求轮换/清除会话 cookie。用于区分
+    // "cookie 没了"（重登录可救）与 "cookie 在但被服务端拒绝"（指向账号/区域层面）。
+    async function buildSessionDiag(status, bodyText, headers) {
+        const parts = ['HTTP ' + (status || '无响应')];
+        let code = '';
+        try {
+            const j = JSON.parse(bodyText);
+            const raw = j && (j.error?.code || j.error?.error_code || j.error?.errorCode || j.error?.message
+                || (typeof j.error === 'string' ? j.error : '') || j.code || j.errorCode || j.message) || '';
+            code = typeof raw === 'string' ? raw : JSON.stringify(raw);
+        } catch {
+            code = String(bodyText || '').slice(0, 80);
+        }
+        code = String(code || '').replace(/[A-Za-z0-9_\-%.]{40,}/g, '…').replace(/\s+/g, ' ').trim().slice(0, 90);
+        if (code) parts.push('resp=' + code);
+        const names = await listCookieNames('https://rewards.bing.com');
+        const watch = ['_RwBf', '_RwBf.corr', 'ANON', 'MUID', '_EDGE_S', '_U', 'SUP', '_Rwho'];
+        parts.push(`jar(${names.length}): ` + watch.map(n => `${n}=${names.includes(n) ? '有' : '无'}`).join(' '));
+        const setNames = parseSetCookiePairs(headers).map(c => c.name + (c.expired ? '(清除)' : ''));
+        if (setNames.length) parts.push('上游set-cookie: ' + setNames.join(','));
+        return parts.join('；');
     }
 
     // 获取热搜词（支持多源自动切换）
@@ -1227,39 +1350,49 @@
                 }
 
                 // 1) rewards.bing.com 会话 cookie（结构最全：含 dailySet/morePromotions）
+                let sessionDiag = '';
                 try {
                     const cookie = await getCookies('https://rewards.bing.com');
-                    let r = null, lastErr = null;
+                    let r = null, lastResp = null;
+                    // withStatus：拿真实 status/headers 做诊断（不再吞 4xx）；
                     // getuserinfo 偶发被截断（返回 200 但 JSON 不完整）→ 校验后重试一次
                     for (let attempt = 0; attempt < 2 && !r; attempt++) {
-                        try {
-                            const resp = await gmRequest({
-                                url: `https://rewards.bing.com/api/getuserinfo?type=1&_=${Date.now()}`,
-                                headers: {
-                                    'X-Requested-With': 'XMLHttpRequest',
-                                    'Referer': 'https://rewards.bing.com/',
-                                    ...(cookie ? { 'Cookie': cookie } : {})
-                                },
-                                anonymous: !!cookie
-                            });
-                            JSON.parse(resp); // 校验完整性，截断则抛错进入重试
-                            r = resp;
-                        } catch (e) { lastErr = e; if (attempt < 1) await sleep(600); }
+                        const resp = await gmRequest({
+                            url: `https://rewards.bing.com/api/getuserinfo?type=1&_=${Date.now()}`,
+                            headers: {
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Referer': 'https://rewards.bing.com/',
+                                ...(cookie ? { 'Cookie': cookie } : {})
+                            },
+                            anonymous: !!cookie,
+                            withStatus: true
+                        }).catch(() => null);
+                        if (resp && resp.status >= 200 && resp.status < 300) {
+                            try {
+                                JSON.parse(resp.text); // 校验完整性，截断则视为失败重试
+                                r = resp;
+                            } catch { lastResp = resp; if (attempt < 1) await sleep(600); }
+                        } else {
+                            lastResp = resp || { status: 0, text: '', headers: '' };
+                            if (attempt < 1) await sleep(600);
+                        }
                     }
                     if (r) {
-                        const d = JSON.parse(r);
+                        const d = JSON.parse(r.text);
                         if (d && (d.dashboard?.userStatus || d.response?.userStatus)) {
                             data = d; source = 'cookie'; lastDashboardSource = source;
                             state.rewardsSessionOk = true;
                         } else {
                             state.rewardsSessionOk = false;
+                            sessionDiag = await buildSessionDiag(r.status, r.text, r.headers);
                         }
-                    } else if (lastErr && lastErr.status === 401) {
+                    } else if (lastResp && lastResp.status === 401) {
                         // rewards.bing.com 会话无效：此后页面内点击会被站点弹去登录页，
                         // 这是"点活动就整页跳登录"的土壤，必须显式标记并停止页面点击流程。
                         state.rewardsSessionOk = false;
-                    } else if (lastErr) {
-                        log('🍪 getuserinfo: ' + lastErr.message);
+                        sessionDiag = await buildSessionDiag(lastResp.status, lastResp.text, lastResp.headers);
+                    } else if (lastResp) {
+                        log('🍪 getuserinfo: ' + (lastResp.status ? 'HTTP ' + lastResp.status : '网络错误'));
                     }
                 } catch (e) {
                     if (e.status === 401) state.rewardsSessionOk = false;
@@ -1267,8 +1400,8 @@
                 }
                 if (state.rewardsSessionOk === false && !rewardsSessionWarned) {
                     rewardsSessionWarned = true;
-                    log('⚠️ rewards.bing.com 会话已失效（接口 401）：站点会把你弹到登录页，已暂停页面点击类活动；请先在该站点重新登录或改用「获取授权码」');
-                    dbg('会话健康: cookie getuserinfo 401 → 暂停页面点击路径（防站点 OAuth 弹跳）');
+                    log(`⚠️ rewards.bing.com 会话已失效（getuserinfo ${sessionDiag || 'HTTP ?'}）：站点会把你弹到登录页，已暂停页面点击类活动；请先在该站点重新登录或改用「获取授权码」`);
+                    dbg('会话健康: cookie getuserinfo 失败 → 暂停页面点击路径（防站点 OAuth 弹跳）');
                 } else if (state.rewardsSessionOk === true) {
                     if (rewardsSessionWarned) log('✅ rewards 会话已恢复，页面点击类活动已解除暂停');
                     rewardsSessionWarned = false;   // 会话恢复后允许再次告警
@@ -3771,6 +3904,22 @@
                 const redirectUri = authParams.get('redirect_uri') || '(无)';
                 const initiator = clientId === '0000000040170455' ? '本脚本' : '微软页面自身/其它客户端';
                 log(`🔎 本次授权页由 ${initiator} 发起（client_id=${clientId} redirect_uri=${dbgSafeUrl(redirectUri, 90)}）`);
+            }
+
+            // 站点自己的 OAuth 回调页（rewards.bing.com/auth/callback）：只负责让站点完成
+            // 登录，脚本在这页上抢跑完整数据流程不仅无意义，还会和站点自己的令牌交换赛跑
+            // ——日志实证"跳完 OAuth 落回 /earn 时会话立刻 401"。这里只做探测记录后返回。
+            if (/(^|\.)rewards\.bing\.com$/i.test(location.hostname) && /^\/auth\/callback\/?$/i.test(location.pathname)) {
+                const p = new URLSearchParams(location.search);
+                const cbErr = p.get('error') || '';
+                log(`🔐 站点 OAuth 回调页：code=${p.get('code') ? '有' : '无'}${cbErr ? ' error=' + cbErr : ''} state=${p.get('state') ? '有' : '无'}`);
+                dbg(`site auth/callback: error=${cbErr} href=${dbgSafeUrl(location.href, 120)}`);
+                setTimeout(async () => {
+                    const names = await listCookieNames('https://rewards.bing.com');
+                    log(`🔐 回调后 rewards 域 cookie：_RwBf=${names.includes('_RwBf') ? '有' : '无'} _RwBf.corr=${names.includes('_RwBf.corr') ? '有' : '无'}（共 ${names.length} 枚）`);
+                    dbg('site auth/callback jar: ' + names.join(','));
+                }, 1200);
+                return;
             }
 
             // 0) 活动任务页 / OAuth 回调页：处理完立即返回，不进入正常数据流程
