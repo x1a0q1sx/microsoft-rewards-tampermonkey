@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.2.2
+// @version      1.1.2.3
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.2.2';
+        const SCRIPT_VERSION = '1.1.2.3';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -550,7 +550,10 @@
         if (code) parts.push('resp=' + code);
         const names = await listCookieNames('https://rewards.bing.com');
         const watch = ['_RwBf', '_RwBf.corr', 'ANON', 'MUID', '_EDGE_S', '_U', 'SUP', '_Rwho'];
-        parts.push(`jar(${names.length}): ` + watch.map(n => `${n}=${names.includes(n) ? '有' : '无'}`).join(' '));
+        // 2026-09-28 实测：本环境（Edge+TM MV3）GM_cookie.list 常返回空，看不到真实 jar
+        // （DevTools 证实 _RwBf 等其实都在、也随请求发出）。这里只是"GM 可见的 cookie"，
+        // 为 0 不代表浏览器真没 cookie，别据此下"会话 cookie 没了"的结论。
+        parts.push(`GM可见jar(${names.length}): ` + watch.map(n => `${n}=${names.includes(n) ? '有' : '无'}`).join(' '));
         const setNames = parseSetCookiePairs(headers).map(c => c.name + (c.expired ? '(清除)' : ''));
         if (setNames.length) parts.push('上游set-cookie: ' + setNames.join(','));
         return parts.join('；');
@@ -1400,7 +1403,7 @@
                 }
                 if (state.rewardsSessionOk === false && !rewardsSessionWarned) {
                     rewardsSessionWarned = true;
-                    log(`⚠️ rewards.bing.com 会话已失效（getuserinfo ${sessionDiag || 'HTTP ?'}）：站点会把你弹到登录页，已暂停页面点击类活动；请先在该站点重新登录或改用「获取授权码」`);
+                    log(`⚠️ rewards.bing.com 会话已失效（getuserinfo ${sessionDiag || 'HTTP ?'}）：站点会把你弹到登录页，已暂停页面点击类活动；请先在该站点重新登录或改用「获取授权码」。注意：若站点页面自己也反复弹登录（积分闪现/消失），多为服务端拒绝建立会话（区域/账号策略），重登录无效`);
                     dbg('会话健康: cookie getuserinfo 失败 → 暂停页面点击路径（防站点 OAuth 弹跳）');
                 } else if (state.rewardsSessionOk === true) {
                     if (rewardsSessionWarned) log('✅ rewards 会话已恢复，页面点击类活动已解除暂停');
