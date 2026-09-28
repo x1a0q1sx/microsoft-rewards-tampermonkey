@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.2.0
+// @version      1.1.2.1
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.2.0';
+        const SCRIPT_VERSION = '1.1.2.1';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -1270,7 +1270,9 @@
                     log('⚠️ rewards.bing.com 会话已失效（接口 401）：站点会把你弹到登录页，已暂停页面点击类活动；请先在该站点重新登录或改用「获取授权码」');
                     dbg('会话健康: cookie getuserinfo 401 → 暂停页面点击路径（防站点 OAuth 弹跳）');
                 } else if (state.rewardsSessionOk === true) {
+                    if (rewardsSessionWarned) log('✅ rewards 会话已恢复，页面点击类活动已解除暂停');
                     rewardsSessionWarned = false;   // 会话恢复后允许再次告警
+                    clearPromoBounceState();        // 会话恢复，弹跳熔断一并复位
                 }
 
                 // Bing Flyout 兜底：Chrome 下旧 API/移动 API 可能缺失 PCSearch 计数器
@@ -3468,9 +3470,15 @@
             const deviceCookie = isMobile ? `_Rwho=u=m&ts=${getDateHyphen()}` : `_Rwho=u=d&ts=${getDateHyphen()}`;
             const searchUrl = `https://${host}/search?q=${encodeURIComponent(query)}&form=QBLH`;
 
+            // 只清搜索会话相关的 _EDGE_S/_Rwho；绝不能删 _RwBf —— 它挂在 .bing.com 域，
+            // 是 rewards.bing.com 的会话 cookie（GM_cookie.delete 按 url+name 匹配会删掉整个域的）。
+            // 之前每轮搜索删它 → rewards 登录态被拆 → 站点弹 OAuth → /auth/callback 重设 →
+            // 下一轮搜索又删，形成"会话反复 401 → 活动被弹登录"的死循环（2026-09-25 日志实证：
+            // 搜索结束 66 秒后站点自发弹登录）。
+            // 搜索计分实际依赖请求头里的 deviceCookie（_Rwho=u=d/m），与浏览器 cookie 无关。
             await deleteCookie('_EDGE_S', host);
             await deleteCookie('_Rwho', host);
-            await deleteCookie('_RwBf', host);
+            dbg(`搜索前清理会话 cookie（保留 _RwBf 以维持 rewards 登录态）@ ${host}`);
 
             try {
                 // 执行搜索
