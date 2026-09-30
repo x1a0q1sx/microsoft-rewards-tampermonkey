@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.3.0
+// @version      1.1.4.0
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -37,7 +37,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.3.0';
+        const SCRIPT_VERSION = '1.1.4.0';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -113,6 +113,7 @@
     const DAILY_STREAK_STATE_KEY = 'mr_daily_streak_state';    // 每日连续打卡状态
     const AUTO_CLOSE_TAB_PREFIX = '__MR_AUTO_CLOSE_ACTIVITY__:'; // 自动关闭标记前缀
     const TASK_TAB_TIMEOUT = 60 * 1000;   // 等待任务标签完成的上限
+    const CLICK_TAB_TAKEOVER_TIMEOUT = 10 * 1000;  // 点击后等待任务标签接管的上限，超时则后台直达兜底
     const TASK_TAB_TTL = 10 * 60 * 1000;  // 任务标签状态有效期
     // 默认只在悬浮窗显示关键结果；完整诊断仍保留在代码中，排障时可改为 true。
     const SHOW_DETAIL_LOGS = false;
@@ -234,6 +235,8 @@
         : (error?.message || '未知错误');
     let promoPageReady = false;
     let dailyStreakGroupHandled = false;
+    // 打卡子卡是否发起过真实点击：用于区分「面板不可用」（可回退普通路径）与「面板内点击失败」（交上层重试）
+    let dailyStreakSubClicksAttempted = false;
     let autoCloseAfterPromo = false;
     let autoCloseMarkerId = '';
     let autoCloseTabMode = false;
@@ -2332,6 +2335,32 @@
         return false;
     }
 
+    // 标记已被任务页消费（从待匹配列表移除）或已回报完成 = 有标签接管了这次导航
+    function taskTabConsumed(id) {
+        return !readTaskTabs().some(item => item.id === id) || !!readTaskTabStates()[id]?.done;
+    }
+
+    async function waitTaskTabTakeover(id, timeout = CLICK_TAB_TAKEOVER_TIMEOUT) {
+        const end = Date.now() + timeout;
+        while (Date.now() < end) {
+            if (taskTabConsumed(id)) return true;
+            await sleep(500);
+        }
+        return false;
+    }
+
+    // 合成点击可能被弹窗拦截、命中零尺寸元素或被站点 preventDefault 后无动作；
+    // 兜底后台直达同一 URL：标记已在册，任务页会自报完成并自动关闭。
+    function openTaskTabDirect(url) {
+        try {
+            GM_openInTab(url, { active: false, insert: true, setParent: true });
+            return true;
+        } catch (e) {
+            dbg(`GM_openInTab 兜底失败: ${e.message}`);
+            return false;
+        }
+    }
+
     function stripNoopener(el) {
         const anchor = el?.matches?.('a[href]') ? el : el?.querySelector?.('a[href]');
         if (!anchor) return null;
@@ -2662,15 +2691,16 @@
     ));
 
     const isDailyStreakActivityItem = (item) => {
-        const text = normalizeDomText([
-            item?.title,
-            item?.attributes?.title,
-            item?.type,
-            item?.attributes?.type,
-            item?.offerId,
-            item?.attributes?.offerid
-        ].filter(Boolean).join(' '));
-        return /每日连续打卡活动|dailystreakactivity|dailystreak|dailyset|streak/.test(text);
+        // 2026-09-30 收紧：旧正则含裸 dailyset/streak，会把「每日活动」普通子卡
+        // （offerId=Gamification_DailySet_*_ChildN）误判成打卡活动，进而走打卡面板流程；
+        // 面板入口缺失（如完成后改名）时就地 3 连败且无兜底。现在只认：
+        // ①标题含「每日连续打卡活动」②offerId 含 dailystreak ③type 恰为 streak。
+        const title = normalizeDomText([item?.title, item?.attributes?.title].filter(Boolean).join(' '));
+        if (/每日连续打卡活动|dailystreakactivity/.test(title)) return true;
+        const offerId = normalizeDomText([item?.offerId, item?.attributes?.offerid].filter(Boolean).join(' '));
+        if (/dailystreak/.test(offerId)) return true;
+        const type = normalizeDomText([item?.type, item?.attributes?.type].filter(Boolean).join(' '));
+        return type === 'streak';
     };
 
     function getVisibleElements(selector) {
@@ -2994,6 +3024,7 @@
             log('ℹ️ 每日连续打卡活动本轮已处理，跳过重复点击');
             return true;
         }
+        dailyStreakSubClicksAttempted = false;
         await ensureDailyActivityGroup();
 
         let panel = await openDailyStreakActivityPanel();
@@ -3047,13 +3078,26 @@
                 // 子卡目的地是 bing 搜索页：登记任务标记，让新开的标签自报完成并自动关闭，
                 // 不再靠主页面事后收拾（此前子卡标签会一直滞留）。
                 const subHref = getCardHref(card);
+                let subTaskId = null;
                 if (subHref && /^https?:\/\/(www\.|cn\.)?bing\.com\//i.test(subHref)) {
-                    addTaskTab(uuid(), subHref);
+                    subTaskId = uuid();
+                    addTaskTab(subTaskId, subHref);
                 }
                 dbg(`打卡子卡点击 ${taskNumber}/3: "${text.slice(0, 30)}" tag=<${card.tagName}> href=${String(subHref).slice(0, 90)} target=${getCardTarget(card) || '无'}`);
+                dailyStreakSubClicksAttempted = true;
                 await humanClickElement(card);
+                if (subTaskId && !(await waitTaskTabTakeover(subTaskId))) {
+                    // 子卡点击未产生新标签（弹窗拦截/零尺寸元素）：后台直达同一 URL 兜底
+                    dbg(`打卡子卡点击后无标签接管，改用后台直达: ${String(subHref).slice(0, 90)}`);
+                    openTaskTabDirect(subHref);
+                }
                 await sleep(700);
                 const result = await waitForDailyStreakCardResult(panel, key, beforeProgress, 6000);
+                if (!result.registered && subTaskId && await waitTaskTabDone(subTaskId, 15000)) {
+                    // 任务页自报完成 = 目的地已被访问（计分事件）；面板进度/卡片状态可能滞后
+                    result.registered = true;
+                    dbg(`打卡子卡面板状态滞后，以任务页完成回报为准 ${taskNumber}/3`);
+                }
                 dbg(`打卡子卡结果 ${taskNumber}/3: registered=${result.registered} progress=${result.progress == null ? '未读到' : result.progress} panel仍在=${!!result.panel}`);
                 panel = result.panel;
                 const progress = result.progress;
@@ -3154,7 +3198,16 @@
         // “每日连续打卡活动”不是普通单卡：先打开侧边栏，再点击其中的 3 张子卡。
         // 之前这里只点击外壳，所以只能看到侧边栏，活动进度不会增加。
         if (isDailyStreakActivityItem(item)) {
-            return await completeDailyStreakActivityGroup();
+            dailyStreakSubClicksAttempted = false;
+            const groupDone = await completeDailyStreakActivityGroup();
+            if (groupDone) return true;
+            if (dailyStreakSubClicksAttempted) {
+                // 侧边栏子卡已真实点击过（未全部成功）：交给上层重试，不重复走普通路径再点入口
+                return false;
+            }
+            // 2026-09-30 兜底：打卡入口缺失/改名（如完成后显示「连续 7 天完成每日活动已完成」）
+            // 时不再直接判败，回退为普通卡片定位 + 直达目的地（计分只依赖访问该 URL）。
+            log('  🔁 打卡侧边栏不可用，回退为普通卡片点击/直达兜底');
         }
 
         // 先展开分组；只展开一次，避免每点一张卡又把分组折叠回去。
@@ -3167,7 +3220,9 @@
 
             // 每日连续打卡的正确目标是“每日连续打卡活动”卡片。
             // 不要命中只写“每日连续打卡”的外层侧边栏入口。
-            if (isDailyPageType(item)) {
+            // 真正的「每日连续打卡活动」才重定向到入口卡；普通每日任务集子卡按标题定位，
+            // 不能被带去点打卡入口（2026-09-30 与 isDailyStreakActivityItem 收紧配套）。
+            if (isDailyStreakActivityItem(item)) {
                 const streakCards = all.filter(el => {
                     const text = normalize(el.textContent);
                     return text === '每日连续打卡活动' || text.includes('每日连续打卡活动');
@@ -3180,7 +3235,7 @@
             if (title) {
                 for (const el of all) {
                     const t = normalize(el.textContent);
-                    if (isDailyPageType(item) && t === '每日连续打卡') continue;
+                    if (isDailyStreakActivityItem(item) && t === '每日连续打卡') continue;
                     if (wantedTitle && t.includes(wantedTitle)) return el;
                 }
             }
@@ -3205,7 +3260,20 @@
             card = findCard();
         }
         if (!card) {
-            log('  ⚠️ 未在页面 DOM 找到匹配卡片（标题=' + JSON.stringify(title) + '），跳过');
+            // 2026-09-30 兜底：DOM 定位不到卡片时，若目的地 URL 可用则直接开任务标签
+            // （计分只依赖访问该 URL，任务页自报完成并自动关闭），不再判败空转 3 次重试。
+            if (dest) {
+                log(`  🔁 未命中页面卡片，改用直达任务标签：${title || item.offerId}`);
+                const taskId = uuid();
+                addTaskTab(taskId, dest);
+                if (!openTaskTabDirect(dest)) return false;
+                const done = await waitTaskTabDone(taskId, TASK_TAB_TIMEOUT);
+                log(done
+                    ? `  ✅ 直达任务页已完成并关闭：${title || item.offerId}`
+                    : `  ⚠️ 直达任务页未收到完成回报：${title || item.offerId}`);
+                return done;
+            }
+            log('  ⚠️ 未在页面 DOM 找到匹配卡片且无可直达 URL（标题=' + JSON.stringify(title) + '），跳过');
             return false;
         }
         try {
@@ -3221,6 +3289,12 @@
             await humanClickElement(card);
             setTimeout(() => restoreNoopener(savedRel), 5000);
             if (href) {
+                // 2026-09-30 兜底：点击后任务标签 10 秒内未接管（弹窗拦截/零尺寸元素/
+                // 站点 preventDefault 后无动作），后台直达同一 URL，不再干等满 TASK_TAB_TIMEOUT。
+                if (!(await waitTaskTabTakeover(taskId))) {
+                    log(`  🔁 点击后无任务标签接管，改用后台直达：${title || item.offerId}`);
+                    openTaskTabDirect(href);
+                }
                 const done = await waitTaskTabDone(taskId, TASK_TAB_TIMEOUT);
                 dbg(`任务标签等待结果: done=${done} 耗时=${Math.round((Date.now() - clickStart) / 1000)}s taskId=${taskId}`);
                 log(done
