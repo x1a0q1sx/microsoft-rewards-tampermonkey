@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.4.0
+// @version      1.1.4.1
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -18,6 +18,7 @@
 // @grant        GM_notification
 // @grant        GM_cookie
 // @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // @grant        GM_openInTab
 // @grant        GM_log
 // @connect      bing.com
@@ -37,7 +38,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.4.0';
+        const SCRIPT_VERSION = '1.1.4.1';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -1133,6 +1134,48 @@
                 items.slice(0, 6).forEach((p, i) => log(`🧪 [${i + 1}] ${p.title || '?'} | offerId=${p.offerId || '?'} | hash=${(p.hash || '').slice(0, 8) || '无'} | prog=${p.pointProgress}/${p.pointProgressMax} | complete=${p.complete}`));
             }
             log('🧪 重放完成。若 dailySet 项数>0 且 web 项有 hash，则抓取逻辑正常。');
+        }, '诊断');
+        // 青龙面板 HTTP 执行器（mr_rewards_http.py）配套：一键复制 bing.com 的 _U 会话
+        // cookie 作为 MR_COOKIE_U。_U 若为 HttpOnly 则 document.cookie 读不到——
+        // 此时提示走 F12 手动导出兜底，不报错。
+        GM_registerMenuCommand('📋 复制 _U 凭据(青龙用)', () => {
+            let u = '';
+            try {
+                const m = document.cookie.match(/(?:^|;\s*)_U=([^;]+)/);
+                if (m) u = m[1];
+            } catch (_) {}
+            if (!u) {
+                log('⚠️ document.cookie 读不到 _U（可能为 HttpOnly）。请走 F12：应用 → Cookie → https://www.bing.com → 复制 _U 的值');
+                try {
+                    GM_notification({ text: '读不到 _U，请 F12 → 应用 → Cookie 手动复制（详见面板日志）', title: 'Rewards 凭据导出' });
+                } catch (_) {}
+                return;
+            }
+            const payload = `_U=${u}`;
+            let copied = false;
+            try {
+                if (typeof GM_setClipboard === 'function') {
+                    GM_setClipboard(payload);
+                    copied = true;
+                }
+            } catch (_) {}
+            if (!copied) {
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = payload;
+                    ta.style.cssText = 'position:fixed;opacity:0';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    copied = document.execCommand('copy');
+                    ta.remove();
+                } catch (_) {}
+            }
+            log(copied
+                ? `📋 已复制 _U（len=${u.length}）到剪贴板，请粘贴到青龙环境变量 MR_COOKIE_U`
+                : '⚠️ 剪贴板写入失败，请从上面日志手动复制（未输出值，防泄露）');
+            try {
+                GM_notification({ text: copied ? '_U 已复制，粘贴到青龙环境变量 MR_COOKIE_U' : '剪贴板写入失败，见面板日志', title: 'Rewards 凭据导出' });
+            } catch (_) {}
         }, '诊断');
     }
 
