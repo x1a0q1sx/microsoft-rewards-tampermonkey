@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.4.1
+// @version      1.1.4.2
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -1436,9 +1436,9 @@
                             sessionDiag = await buildSessionDiag(r.status, r.text, r.headers);
                         }
                     } else if (lastResp && lastResp.status === 401) {
-                        // rewards.bing.com 会话无效：此后页面内点击会被站点弹去登录页，
-                        // 这是"点活动就整页跳登录"的土壤，必须显式标记并停止页面点击流程。
-                        state.rewardsSessionOk = false;
+                        // 2026-10-01 站点迁移 Next.js 后 /api/getuserinfo?type=1 已下线
+                        // （401 + SPA HTML），此处不再直接判会话死亡；最终由下方
+                        // Bing Flyout（现役端点）裁决：取到登录数据 = 会话存活。
                         sessionDiag = await buildSessionDiag(lastResp.status, lastResp.text, lastResp.headers);
                     } else if (lastResp) {
                         log('🍪 getuserinfo: ' + (lastResp.status ? 'HTTP ' + lastResp.status : '网络错误'));
@@ -1457,13 +1457,22 @@
                     clearPromoBounceState();        // 会话恢复，弹跳熔断一并复位
                 }
 
-                // Bing Flyout 兜底：Chrome 下旧 API/移动 API 可能缺失 PCSearch 计数器
+                // Bing Flyout 兜底：Chrome 下旧 API/移动 API 可能缺失 PCSearch 计数器；
+                // 2026-10-03 起兼作会话健康判据（旧 /api/getuserinfo 已随 10-01 改版下线）
                 if (!data) {
                     try {
                         data = await fetchDashboardViaBingFlyout();
                         source = 'BingFlyout';
                         lastDashboardSource = source;
+                        // Flyout 取到登录数据 = 会话存活：复位存疑标记与弹跳熔断
+                        state.rewardsSessionOk = true;
+                        if (rewardsSessionWarned) log('✅ rewards 会话已恢复（Flyout 数据正常），弹跳熔断已复位');
+                        rewardsSessionWarned = false;
+                        clearPromoBounceState();
                     } catch (e) {
+                        // 旧端点 401 + Flyout 也失败 → 才真正判会话存疑
+                        state.rewardsSessionOk = false;
+                        sessionDiag = sessionDiag ? `${sessionDiag}; Flyout: ${e.message}` : `Flyout: ${e.message}`;
                         log('⚠️ Bing Flyout 数据获取失败: ' + e.message);
                     }
                 }
