@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.4.3
+// @version      1.1.4.4
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -38,7 +38,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.4.3';
+        const SCRIPT_VERSION = '1.1.4.4';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -47,7 +47,9 @@
 
     // ========== 配置 ==========
         const CONFIG = {
-            pc: { minDelay: 5000, maxDelay: 8000 },
+            // sameTab: 站点 2026-10-01 改版后，纯 HTTP reportActivity 报数与后台标签页搜索
+            // 都不再计分，只有真实前台页面搜索才计分（同 tab 顺序导航，队列经 GM 存储接力）。
+            pc: { minDelay: 5000, maxDelay: 8000, sameTab: true },
             mobile: { minDelay: 20000, maxDelay: 35000 },
         ua: {
             pc: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.2420.81',
@@ -3701,6 +3703,99 @@
     };
     nodes.btnPromo.onclick = () => runPromo(true);
 
+    // ========== 同 tab 前台搜索 ==========
+    // 2026-10-01 站点迁移 Next.js 后实测（2026-10-05）：纯 HTTP reportActivity 报数不计分，
+    // 后台标签页搜索也不计分，只有真实前台页面搜索才计分（+3/次）。
+    // 方案：搜索队列存 GM 存储，rewards 页发起后本 tab 逐个导航到搜索页；每个搜索页
+    // 加载后停留随机时长再跳下一个，全部完成后导航回 rewards.bing.com/earn。
+    const ST_PLAN_KEY = 'mr_same_tab_search_plan_v1';
+    const ST_PLAN_TTL = 30 * 60 * 1000;
+
+    function readSameTabPlan() {
+        try {
+            const raw = GM_getValue(ST_PLAN_KEY, '');
+            if (!raw) return null;
+            const plan = JSON.parse(raw);
+            if (!plan || !Array.isArray(plan.queries) || !plan.queries.length) return null;
+            return plan;
+        } catch (_) { return null; }
+    }
+
+    function writeSameTabPlan(plan) {
+        try { GM_setValue(ST_PLAN_KEY, JSON.stringify(plan)); } catch (_) {}
+    }
+
+    function clearSameTabPlan() {
+        try { GM_setValue(ST_PLAN_KEY, ''); } catch (_) {}
+    }
+
+    function buildBingSearchUrl(query) {
+        return `https://www.bing.com/search?q=${encodeURIComponent(query)}&form=QBLH`;
+    }
+
+    async function startSameTabSearch(queries) {
+        writeSameTabPlan({
+            queries,
+            idx: 0,
+            startedAt: Date.now(),
+            updatedAt: Date.now(),
+            startPc: `${state.pcCur}/${state.pcMax}`
+        });
+        log(`💻 同tab前台搜索 ${queries.length} 次（改版后仅真实页面搜索计分）`);
+        const firstUrl = buildBingSearchUrl(queries[0]);
+        markNavIntent('同tab前台搜索：前往第 1 个搜索', firstUrl);
+        try { location.href = firstUrl; } catch (_) { location.assign(firstUrl); }
+    }
+
+    // 每个页面 init 时调用：命中当前计划的搜索页则停留→推进→跳下一个/返回 Rewards
+    async function maybeContinueSameTabSearch() {
+        const plan = readSameTabPlan();
+        if (!plan) return false;
+        const onBingSearch = /(^|\.)bing\.com$/i.test(location.hostname) && location.pathname === '/search';
+        if (!onBingSearch) {
+            if (isRewardsPage() && plan.idx >= plan.queries.length) {
+                clearSameTabPlan();
+                log(`🏁 同tab前台搜索完成（${plan.queries.length} 次，此前额度 ${plan.startPc}）`);
+            }
+            return false;
+        }
+        if (Date.now() - (plan.updatedAt || plan.startedAt) > ST_PLAN_TTL) {
+            clearSameTabPlan();
+            log('⏹ 同tab搜索计划超时，已放弃（请回到 Rewards 重新执行）');
+            return false;
+        }
+        const q = new URLSearchParams(location.search).get('q') || '';
+        const expected = plan.queries[plan.idx] || '';
+        if (!expected || q !== expected) return false; // 不是本计划的搜索页（用户自己浏览的不接管）
+
+        let stayMs = randomRange(CONFIG.pc.minDelay, CONFIG.pc.maxDelay);
+        state.searchCount++;
+        saveProgress();
+        if (CONFIG.pause.enabled && state.searchCount % CONFIG.pause.interval === 0) {
+            stayMs += CONFIG.pause.duration;
+            log(`⏸️ 已完成 ${state.searchCount} 次搜索，本页多停留 ${Math.round(CONFIG.pause.duration / 1000)}s 降低风险`);
+        }
+        log(`💻 同tab搜索 ${plan.idx + 1}/${plan.queries.length}: "${String(expected).slice(0, 18)}"`);
+
+        plan.idx += 1;
+        plan.updatedAt = Date.now();
+        writeSameTabPlan(plan);
+
+        await sleep(stayMs);
+        if (plan.idx < plan.queries.length) {
+            const nextUrl = buildBingSearchUrl(plan.queries[plan.idx]);
+            markNavIntent(`同tab前台搜索：第 ${plan.idx + 1}/${plan.queries.length} 个`, nextUrl);
+            try { location.href = nextUrl; } catch (_) { location.assign(nextUrl); }
+        } else {
+            clearSameTabPlan();
+            log(`🏁 同tab前台搜索完成（${plan.queries.length} 次），返回 Rewards 刷新额度`);
+            const backUrl = getRewardsResumeUrl('');
+            markNavIntent('同tab前台搜索完成，返回Rewards', backUrl);
+            try { location.href = backUrl; } catch (_) { location.assign(backUrl); }
+        }
+        return true;
+    }
+
     const runSearch = async () => {
         if (state.running) {
             state.running = false;
@@ -3839,6 +3934,14 @@
         } else {
             const pcNeed = Math.ceil((state.pcMax - state.pcCur) / 3);
             if (pcNeed > 0) {
+                // 同 tab 前台模式：真实页面搜索才计分（见 ST_PLAN_KEY 上方说明）。
+                // 发起后页面跳走，本函数后续逻辑（含移动搜索）由返回 Rewards 后手动/自动续跑。
+                if (CONFIG.pc.sameTab !== false) {
+                    const queries = [];
+                    for (let i = 0; i < pcNeed; i++) queries.push(await getHotQuery());
+                    await startSameTabSearch(queries);
+                    return;
+                }
                 log(`💻 PC搜索 ${pcNeed}次`);
                 for (let i = 0; i < pcNeed && state.running; i++) {
                     await waitWhilePaused();
@@ -4043,9 +4146,10 @@
                 return;
             }
 
-            // 0) 活动任务页 / OAuth 回调页：处理完立即返回，不进入正常数据流程
+            // 0) 活动任务页 / OAuth 回调页 / 同tab搜索接力页：处理完立即返回，不进入正常数据流程
             if (handleRewardsTaskTab()) return;
             if (handleAuthCallback()) return;
+            if (await maybeContinueSameTabSearch()) return;
 
             const isTrackedActivityTab = markCurrentAutoCloseActivityTab();
             startAutoCloseActivityTabMonitor();
