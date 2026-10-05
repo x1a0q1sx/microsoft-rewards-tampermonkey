@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.4.6
+// @version      1.1.4.7
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -38,7 +38,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.4.6';
+        const SCRIPT_VERSION = '1.1.4.7';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -3815,27 +3815,43 @@
     // 回 /earn 重读「活动/签到/分钟/搜索/日常任务」计数器写入日志。
     const PV_PLAN_KEY = 'mr_promo_visit_plan_v1';
     const PV_VISITED_KEY = 'mr_promo_visited_v1';
+    const PV_STARTS_KEY = 'mr_promo_starts_v1';
     const PV_PLAN_TTL = 30 * 60 * 1000;
+    const PV_MAX_STARTS_PER_DAY = 3; // 每日最多启动队列次数（防 href 漂移导致的重复循环）
 
     function pvDayKey() {
         const d = new Date();
         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     }
 
+    // 去重键用 OCID：/earn 每次渲染链接的 form/OCID 值可能变化，整条 href 会漂移导致去重失效
     function readPromoVisited() {
         try {
             const raw = GM_getValue(PV_VISITED_KEY, '');
             const obj = raw ? JSON.parse(raw) : null;
-            if (obj && obj.day === pvDayKey() && Array.isArray(obj.urls)) return obj;
+            if (obj && obj.day === pvDayKey() && Array.isArray(obj.ocids)) return obj;
         } catch (_) {}
-        return { day: pvDayKey(), urls: [] };
+        return { day: pvDayKey(), ocids: [] };
     }
 
-    function markPromoVisited(href) {
+    function markPromoVisited(ocid) {
         try {
             const v = readPromoVisited();
-            if (!v.urls.includes(href)) { v.urls.push(href); GM_setValue(PV_VISITED_KEY, JSON.stringify(v)); }
+            if (ocid && !v.ocids.includes(ocid)) { v.ocids.push(ocid); GM_setValue(PV_VISITED_KEY, JSON.stringify(v)); }
         } catch (_) {}
+    }
+
+    function pvStartsToday() {
+        try {
+            const raw = GM_getValue(PV_STARTS_KEY, '');
+            const obj = raw ? JSON.parse(raw) : null;
+            if (obj && obj.day === pvDayKey()) return obj.n || 0;
+        } catch (_) {}
+        return 0;
+    }
+
+    function pvNoteStart() {
+        try { GM_setValue(PV_STARTS_KEY, JSON.stringify({ day: pvDayKey(), n: pvStartsToday() + 1 })); } catch (_) {}
     }
 
     function readPromoPlan() {
@@ -3866,7 +3882,7 @@
         return m ? m[1] : '';
     }
 
-    // 在 rewards 页收集推广链接：bing 搜索/spotlight 且带 OCID 参数；过滤今日已访问
+    // 在 rewards 页收集推广链接：bing 搜索/spotlight 且带 OCID 参数；按 OCID 过滤今日已访问
     function collectPromoLinks() {
         const out = [];
         const seen = new Set();
@@ -3877,10 +3893,12 @@
                 if (!/[?&]OCID=/i.test(href)) return;
                 if (!/(^|\.)bing\.(com|cn)\/(search|spotlight)/i.test(href)) return;
                 const key = href.split('#')[0];
-                if (seen.has(key) || visited.urls.indexOf(key) !== -1) return;
-                seen.add(key);
+                const ocid = pvExtractOcid(key);
+                if (!ocid) return; // 无 OCID 无法在计划接力时匹配，跳过
+                if (seen.has(ocid) || visited.ocids.indexOf(ocid) !== -1) return;
+                seen.add(ocid);
                 const title = (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
-                out.push({ href: key, title, ocid: pvExtractOcid(key) });
+                out.push({ href: key, title, ocid });
             });
         } catch (_) {}
         return out.slice(0, 12); // 单次上限，防失控
@@ -3907,11 +3925,16 @@
 
     async function runPromoVisits() {
         if (readPromoPlan()) return; // 已有计划在途，由页面接力恢复
+        if (pvStartsToday() >= PV_MAX_STARTS_PER_DAY) {
+            log('🎯 推广任务：今日已跑满启动次数上限，跳过（防循环保护）');
+            return;
+        }
         const links = await collectPromoLinksWithDialog();
         if (!links.length) {
             log('🎯 推广任务：今日卡片均已访问或暂无可访问链接');
             return;
         }
+        pvNoteStart();
         writePromoPlan({ urls: links, idx: 0, startedAt: Date.now(), updatedAt: Date.now() });
         log(`🎯 推广任务访问 ${links.length} 个（打卡活动/日常任务）：${links.map(l => l.title || l.ocid).slice(0, 5).join('、')}`);
         const first = links[0].href;
@@ -3949,7 +3972,7 @@
         if (!expected || !expected.ocid || curOcid !== expected.ocid) return false; // 不是本计划的页面（用户自己浏览的不接管）
 
         log(`🎯 推广访问 ${plan.idx + 1}/${plan.urls.length}: "${expected.title || expected.ocid}"`);
-        markPromoVisited(expected.href);
+        markPromoVisited(expected.ocid);
         plan.idx += 1;
         plan.updatedAt = Date.now();
         writePromoPlan(plan);
