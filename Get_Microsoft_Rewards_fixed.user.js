@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.4.5
+// @version      1.1.4.6
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -38,7 +38,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.4.5';
+        const SCRIPT_VERSION = '1.1.4.6';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -3425,7 +3425,12 @@
         const resumingPromo = pendingKeys.size > 0;
         if (resumingPromo) log(`↩️ 恢复上次被页面跳转中断的活动（${pendingKeys.size} 项）`);
 
-        const promos = (dashboard && (dashboard.promotions || dashboard.morePromotions)) || [];
+        const promos = ((dashboard && (dashboard.promotions || dashboard.morePromotions)) || [])
+            // 邀请/推荐类卡片永远无法在脚本内完成（需要好友真实搜索才有进度），点击只会
+            // 打开邀请页把一键流程拐走（2026-10-05 实测：签到流程两次误点「邀请好友」卡，
+            // 页面在 refer↔earn 间循环）。在源头过滤，残留的待办也会因 webItems 为空而自愈清空。
+            .filter(p => !/邀请|好友|推荐转化|将推荐|refer/i.test(getActivityTitle(p) || '') &&
+                         !/\/refer/i.test(p.destinationUrl || ''));
         if (!promos.length) {
             log('⚠️ 未获取到活动列表，请先完成授权');
             nodes.btnPromo.disabled = false;
