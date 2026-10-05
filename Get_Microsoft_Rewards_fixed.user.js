@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.4.4
+// @version      1.1.4.5
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -38,7 +38,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.4.4';
+        const SCRIPT_VERSION = '1.1.4.5';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -51,6 +51,8 @@
             // 都不再计分，只有真实前台页面搜索才计分（同 tab 顺序导航，队列经 GM 存储接力）。
             pc: { minDelay: 5000, maxDelay: 8000, sameTab: true },
             mobile: { minDelay: 20000, maxDelay: 35000 },
+            // 推广任务页（打卡活动/日常任务卡片目标页）停留时长
+            promo: { minDelay: 6000, maxDelay: 10000 },
         ua: {
             pc: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.2420.81',
             mobile: 'Mozilla/5.0 (Linux; Android 16; MCE16 Build/BP3A.250905.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36 EdgA/123.0.2420.102'
@@ -3739,7 +3741,8 @@
             idx: 0,
             startedAt: Date.now(),
             updatedAt: Date.now(),
-            startPc: `${state.pcCur}/${state.pcMax}`
+            startPc: `${state.pcCur}/${state.pcMax}`,
+            startedByAuto: state.allRunning === true
         });
         log(`💻 同tab前台搜索 ${queries.length} 次（改版后仅真实页面搜索计分）`);
         const firstUrl = buildBingSearchUrl(queries[0]);
@@ -3789,11 +3792,205 @@
         } else {
             clearSameTabPlan();
             log(`🏁 同tab前台搜索完成（${plan.queries.length} 次），返回 Rewards 刷新额度`);
-            const backUrl = getRewardsResumeUrl('');
+            // 一键流程发起的搜索链：返回时带上 mr_auto_run=1，让 runAll 在返回页自动续跑
+            // （签到/阅读在流程里已幂等，推广任务队列空后自然推进到搜索/刷积分），否则流程断链。
+            const backUrl = getRewardsResumeUrl('') + (plan.startedByAuto ? '?mr_auto_run=1' : '');
             markNavIntent('同tab前台搜索完成，返回Rewards', backUrl);
             try { location.href = backUrl; } catch (_) { location.assign(backUrl); }
         }
         return true;
+    }
+
+    // ========== OCID 推广任务访问（每日连续打卡活动 + 日常任务） ==========
+    // 2026-10-01 改版后 /earn 页的「每日连续打卡活动 (x/3)」「日常任务 (x/35)」等卡片
+    // 都是带 OCID=MLxxxxx 营销参数的 bing 搜索/spotlight 链接，官方交互 = 点击访问目标页。
+    // 实测（2026-10-05）：直接访问这些链接在当前账号上未即时 punch（计数器/积分明细均无变化，
+    // 疑似服务端 punch 管线问题），但访问 = 官方唯一给到的交互路径，照做并在日志里闭环核对。
+    // 方案：rewards 页收集未访问过的推广链接 → 同 tab 逐个访问（停留+滚动）→ 全部完成后
+    // 回 /earn 重读「活动/签到/分钟/搜索/日常任务」计数器写入日志。
+    const PV_PLAN_KEY = 'mr_promo_visit_plan_v1';
+    const PV_VISITED_KEY = 'mr_promo_visited_v1';
+    const PV_PLAN_TTL = 30 * 60 * 1000;
+
+    function pvDayKey() {
+        const d = new Date();
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+
+    function readPromoVisited() {
+        try {
+            const raw = GM_getValue(PV_VISITED_KEY, '');
+            const obj = raw ? JSON.parse(raw) : null;
+            if (obj && obj.day === pvDayKey() && Array.isArray(obj.urls)) return obj;
+        } catch (_) {}
+        return { day: pvDayKey(), urls: [] };
+    }
+
+    function markPromoVisited(href) {
+        try {
+            const v = readPromoVisited();
+            if (!v.urls.includes(href)) { v.urls.push(href); GM_setValue(PV_VISITED_KEY, JSON.stringify(v)); }
+        } catch (_) {}
+    }
+
+    function readPromoPlan() {
+        try {
+            const raw = GM_getValue(PV_PLAN_KEY, '');
+            if (!raw) return null;
+            const plan = JSON.parse(raw);
+            if (!plan || !Array.isArray(plan.urls) || !plan.urls.length) return null;
+            if (Date.now() - (plan.updatedAt || plan.startedAt) > PV_PLAN_TTL) {
+                clearPromoPlan();
+                log('⏹ 推广任务访问计划超时，已放弃（下次执行会重新收集）');
+                return null;
+            }
+            return plan;
+        } catch (_) { return null; }
+    }
+
+    function writePromoPlan(plan) {
+        try { GM_setValue(PV_PLAN_KEY, JSON.stringify(plan)); } catch (_) {}
+    }
+
+    function clearPromoPlan() {
+        try { GM_setValue(PV_PLAN_KEY, ''); } catch (_) {}
+    }
+
+    function pvExtractOcid(href) {
+        const m = String(href || '').match(/[?&]OCID=([^&#]+)/i);
+        return m ? m[1] : '';
+    }
+
+    // 在 rewards 页收集推广链接：bing 搜索/spotlight 且带 OCID 参数；过滤今日已访问
+    function collectPromoLinks() {
+        const out = [];
+        const seen = new Set();
+        const visited = readPromoVisited();
+        try {
+            document.querySelectorAll('a[href]').forEach(a => {
+                const href = a.href || '';
+                if (!/[?&]OCID=/i.test(href)) return;
+                if (!/(^|\.)bing\.(com|cn)\/(search|spotlight)/i.test(href)) return;
+                const key = href.split('#')[0];
+                if (seen.has(key) || visited.urls.indexOf(key) !== -1) return;
+                seen.add(key);
+                const title = (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+                out.push({ href: key, title, ocid: pvExtractOcid(key) });
+            });
+        } catch (_) {}
+        return out.slice(0, 12); // 单次上限，防失控
+    }
+
+    // 「每日连续打卡活动」的 3 张活动卡在弹窗里，可能按需渲染 —— 先尝试打开弹窗再收集
+    async function collectPromoLinksWithDialog() {
+        let links = collectPromoLinks();
+        try {
+            const opener = [...document.querySelectorAll('button,[role="button"]')]
+                .find(b => /每日连续打卡活动/.test(b.textContent || ''));
+            if (opener) {
+                opener.click();
+                await sleep(1800);
+                links = collectPromoLinks();
+                const dialog = document.querySelector('[role="dialog"]') || document;
+                const closer = [...dialog.querySelectorAll('button')]
+                    .find(b => /^(关闭|關閉|Close)$/i.test((b.textContent || '').trim()));
+                if (closer) { closer.click(); await sleep(600); }
+            }
+        } catch (_) {}
+        return links;
+    }
+
+    async function runPromoVisits() {
+        if (readPromoPlan()) return; // 已有计划在途，由页面接力恢复
+        const links = await collectPromoLinksWithDialog();
+        if (!links.length) {
+            log('🎯 推广任务：今日卡片均已访问或暂无可访问链接');
+            return;
+        }
+        writePromoPlan({ urls: links, idx: 0, startedAt: Date.now(), updatedAt: Date.now() });
+        log(`🎯 推广任务访问 ${links.length} 个（打卡活动/日常任务）：${links.map(l => l.title || l.ocid).slice(0, 5).join('、')}`);
+        const first = links[0].href;
+        markNavIntent('推广任务访问：前往第 1 个', first);
+        try { location.href = first; } catch (_) { location.assign(first); }
+    }
+
+    // 每个页面 init 时调用：命中当前计划的推广页则停留→推进→跳下一个/返回 Rewards
+    async function maybeContinuePromoVisit() {
+        const plan = readPromoPlan();
+        if (!plan) return false;
+        const onBingPromo = /(^|\.)bing\.(com|cn)$/i.test(location.hostname) &&
+            (location.pathname === '/search' || location.pathname.indexOf('/spotlight/') === 0);
+        if (!onBingPromo) {
+            if (isRewardsPage()) {
+                if (plan.idx >= plan.urls.length) {
+                    clearPromoPlan();
+                    log(`🏁 推广任务访问完成（${plan.urls.length} 个），稍后回读计数器`);
+                    logEarnCountersSnapshot();
+                } else if (!state.allRunning && !state.running) {
+                    // 中断恢复：计划在途但页面回到了 rewards（崩溃/用户打断），继续访问下一个
+                    const next = plan.urls[plan.idx];
+                    if (next && next.href) {
+                        log(`↩️ 继续推广任务访问 ${plan.idx + 1}/${plan.urls.length}`);
+                        markNavIntent('推广任务访问恢复', next.href);
+                        try { location.href = next.href; } catch (_) { location.assign(next.href); }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        const curOcid = pvExtractOcid(location.href);
+        const expected = plan.urls[plan.idx];
+        if (!expected || !expected.ocid || curOcid !== expected.ocid) return false; // 不是本计划的页面（用户自己浏览的不接管）
+
+        log(`🎯 推广访问 ${plan.idx + 1}/${plan.urls.length}: "${expected.title || expected.ocid}"`);
+        markPromoVisited(expected.href);
+        plan.idx += 1;
+        plan.updatedAt = Date.now();
+        writePromoPlan(plan);
+
+        try { window.scrollBy({ top: 400 + Math.floor(Math.random() * 400), behavior: 'smooth' }); } catch (_) { try { window.scrollBy(0, 500); } catch (_e) {} }
+        await sleep(randomRange(CONFIG.promo.minDelay, CONFIG.promo.maxDelay));
+        try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch (_) {}
+
+        if (plan.idx < plan.urls.length) {
+            const nextUrl = plan.urls[plan.idx].href;
+            markNavIntent(`推广任务访问：第 ${plan.idx + 1}/${plan.urls.length} 个`, nextUrl);
+            try { location.href = nextUrl; } catch (_) { location.assign(nextUrl); }
+        } else {
+            clearPromoPlan();
+            // 带 mr_auto_run=1 返回，让一键流程（搜索等剩余步骤）在返回页自动续跑
+            const backUrl = getRewardsResumeUrl('') + '?mr_auto_run=1';
+            log(`🏁 推广任务访问完成（${plan.urls.length} 个），返回 Rewards 续跑剩余步骤`);
+            markNavIntent('推广任务完成，返回Rewards', backUrl);
+            try { location.href = backUrl; } catch (_) { location.assign(backUrl); }
+        }
+        return true;
+    }
+
+    // 回读 /earn 页打卡相关计数器入日志（延迟等 React 渲染），仅作核对证据
+    function logEarnCountersSnapshot(delayMs = 8000) {
+        setTimeout(() => {
+            try {
+                const txt = (document.body && document.body.innerText) || '';
+                const grab = (re) => { const m = txt.match(re); return m ? m[0].replace(/\s+/g, '') : null; };
+                const parts = [];
+                const pairs = [
+                    ['活动', /活动[:：]\s*\d+\s*\/\s*\d+/],
+                    ['签到', /签到[:：]\s*\d+\s*\/\s*\d+/],
+                    ['分钟', /分钟[:：]\s*\d+\s*\/\s*\d+/],
+                    ['搜索', /搜索[:：]\s*\d+\s*\/\s*\d+/]
+                ];
+                for (const [name, re] of pairs) {
+                    const v = grab(re);
+                    if (v) parts.push(v);
+                }
+                const dt = txt.match(/日常任务[\s\S]{0,120}?(\d+\s*\/\s*\d+)/);
+                if (dt) parts.push(`日常任务${dt[1].replace(/\s+/g, '')}`);
+                if (parts.length) log(`📊 打卡快照: ${parts.join(' | ')}`);
+                else dbg('打卡快照：页面未渲染出计数器文本');
+            } catch (_) {}
+        }, delayMs);
     }
 
     const runSearch = async () => {
@@ -3999,6 +4196,7 @@
             await waitWhilePaused();
             await runSign();
             await runRead();
+            await runPromoVisits();
             await runSearch();
             await refreshPointsAfterRun(25);
         } finally {
@@ -4150,6 +4348,7 @@
             if (handleRewardsTaskTab()) return;
             if (handleAuthCallback()) return;
             if (await maybeContinueSameTabSearch()) return;
+            if (await maybeContinuePromoVisit()) return;
 
             const isTrackedActivityTab = markCurrentAutoCloseActivityTab();
             startAutoCloseActivityTabMonitor();
