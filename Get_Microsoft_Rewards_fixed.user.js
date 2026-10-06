@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.1.4.7
+// @version      1.1.4.8
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。（会话失效保护：站点弹登录时停止页面点击并熔断自动恢复，防死循环）
 // @updateURL    https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
 // @downloadURL  https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js
@@ -38,7 +38,7 @@
         'use strict';
 
         // ========== 版本与就绪横幅 ==========
-        const SCRIPT_VERSION = '1.1.4.7';
+        const SCRIPT_VERSION = '1.1.4.8';
         const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/x1a0q1sx/microsoft-rewards-tampermonkey/main/Get_Microsoft_Rewards_fixed.user.js?v=' + SCRIPT_VERSION;
         window.__MR_VERSION__ = SCRIPT_VERSION;
         console.log(`%c🔒 Microsoft Rewards 助手 v${SCRIPT_VERSION} 已就绪`,
@@ -3882,25 +3882,40 @@
         return m ? m[1] : '';
     }
 
-    // 在 rewards 页收集推广链接：bing 搜索/spotlight 且带 OCID 参数；按 OCID 过滤今日已访问
-    function collectPromoLinks() {
+    // 2026-10 打卡活动卡链接形如 .../search?q=..&FORM=tgrew4&filters=sid%3A%22<guid>%22&moreparent=1
+    // punch 判据是带 sid 的这次搜索（实测纯 URL 直搜不带 sid 不打卡）；sid 是卡片的稳定键
+    function pvExtractSid(href) {
+        const m = String(href || '').match(/filters=sid(?:%3A|%3a|:)%22([0-9a-f-]{8,})%22/i) ||
+                  String(href || '').match(/filters=sid:"([0-9a-f-]{8,})"/i);
+        return m ? m[1] : '';
+    }
+
+    function pvExtractKey(href) {
+        return pvExtractSid(href) || pvExtractOcid(href);
+    }
+
+    // 在 rewards 页收集推广链接：优先弹窗内带 filters=sid 的打卡卡链接，其次带 OCID 的旧式链接
+    function collectPromoLinks(root) {
         const out = [];
         const seen = new Set();
         const visited = readPromoVisited();
+        const scope = root || document;
         try {
-            document.querySelectorAll('a[href]').forEach(a => {
+            scope.querySelectorAll('a[href]').forEach(a => {
                 const href = a.href || '';
-                if (!/[?&]OCID=/i.test(href)) return;
                 if (!/(^|\.)bing\.(com|cn)\/(search|spotlight)/i.test(href)) return;
                 const key = href.split('#')[0];
-                const ocid = pvExtractOcid(key);
-                if (!ocid) return; // 无 OCID 无法在计划接力时匹配，跳过
-                if (seen.has(ocid) || visited.ocids.indexOf(ocid) !== -1) return;
-                seen.add(ocid);
+                const sid = pvExtractSid(key);
+                const k = sid || pvExtractOcid(key);
+                if (!k) return; // 无 sid/OCID 无法在计划接力时匹配，跳过
+                if (seen.has(k) || visited.ocids.indexOf(k) !== -1) return;
+                seen.add(k);
                 const title = (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
-                out.push({ href: key, title, ocid });
+                out.push({ href: key, title, key: k, ocid: k, sid: sid ? 1 : 0 });
             });
         } catch (_) {}
+        // sid 打卡链接优先排前
+        out.sort((a, b) => (b.sid || 0) - (a.sid || 0));
         return out.slice(0, 12); // 单次上限，防失控
     }
 
@@ -3967,12 +3982,13 @@
             }
             return false;
         }
-        const curOcid = pvExtractOcid(location.href);
+        const curKey = pvExtractKey(location.href);
         const expected = plan.urls[plan.idx];
-        if (!expected || !expected.ocid || curOcid !== expected.ocid) return false; // 不是本计划的页面（用户自己浏览的不接管）
+        const expectedKey = expected && (expected.key || expected.ocid);
+        if (!expected || !expectedKey || !curKey || curKey !== expectedKey) return false; // 不是本计划的页面（用户自己浏览的不接管）
 
-        log(`🎯 推广访问 ${plan.idx + 1}/${plan.urls.length}: "${expected.title || expected.ocid}"`);
-        markPromoVisited(expected.ocid);
+        log(`🎯 推广访问 ${plan.idx + 1}/${plan.urls.length}: "${expected.title || expectedKey}"`);
+        markPromoVisited(expectedKey);
         plan.idx += 1;
         plan.updatedAt = Date.now();
         writePromoPlan(plan);
